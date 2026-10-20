@@ -453,6 +453,21 @@ impl RuffleHandle {
         }
     }
 
+    /// Returns the scenes, frame labels and playhead position of the root movie clip,
+    /// or `null` when there is no root movie clip.
+    pub fn root_timeline(&self) -> JsValue {
+        self.with_core_mut(|core| {
+            core.root_timeline()
+                .and_then(|timeline| serde_wasm_bindgen::to_value(&timeline).ok())
+                .unwrap_or(JsValue::NULL)
+        })
+        .unwrap_or(JsValue::NULL)
+    }
+
+    pub fn goto_and_play_root_frame(&self, frame: u16) {
+        let _ = self.with_core_mut(|core| core.goto_and_play_root_frame(frame));
+    }
+
     pub fn set_fullscreen(&self, is_fullscreen: bool) {
         let _ = self.with_core_mut(|core| core.set_fullscreen(is_fullscreen));
     }

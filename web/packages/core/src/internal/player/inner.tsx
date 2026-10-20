@@ -90,6 +90,23 @@ interface ContextMenuItem {
 }
 
 /**
+ * The scenes and playhead position of the root movie clip,
+ * as returned by `RuffleHandle.root_timeline`.
+ */
+interface RootTimeline {
+    readonly scenes: readonly {
+        readonly name: string;
+        /**
+         * The 1-based frame number the scene starts at.
+         */
+        readonly start: number;
+        readonly length: number;
+    }[];
+    readonly currentFrame: number;
+    readonly framesLoaded: number;
+}
+
+/**
  * Converts arbitrary input to an easy to use record object.
  *
  * @param parameters Parameters to sanitize
@@ -1521,6 +1538,28 @@ export class InnerPlayer {
                         this.instance?.run_context_menu_callback(index),
                     enabled: item.enabled,
                     checked: item.checked,
+                });
+            });
+
+            addSeparator();
+        }
+
+        const timeline: RootTimeline | null =
+            this.instance?.root_timeline() ?? null;
+        // With a single scene there is nowhere else to jump to.
+        if (timeline && timeline.scenes.length > 1) {
+            const { scenes, currentFrame, framesLoaded } = timeline;
+            scenes.forEach((scene, index) => {
+                const nextScene = scenes[index + 1];
+                items.push({
+                    text: text("context-menu-scene", { name: scene.name }),
+                    onClick: async () =>
+                        this.instance?.goto_and_play_root_frame(scene.start),
+                    enabled: scene.start <= framesLoaded,
+                    checked:
+                        scene.start <= currentFrame &&
+                        (nextScene === undefined ||
+                            nextScene.start > currentFrame),
                 });
             });
 
