@@ -46,3 +46,12 @@ debug-menu-search-display-objects = Search Display Objects...
 
 view-menu = View
 view-menu-fullscreen = Full Screen
+
+scenes-menu = Scenes
+scenes-menu-no-scenes = This movie has no scenes
+scenes-menu-previous = Previous Scene
+scenes-menu-next = Next Scene
+scenes-menu-labels = Frame Labels
+scenes-menu-no-labels = This movie has no frame labels
+scenes-menu-frame = Frame
+scenes-menu-go = Go

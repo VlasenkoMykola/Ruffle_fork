@@ -50,6 +50,7 @@ use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
 use crate::orphan_manager::OrphanManager;
 use crate::prelude::*;
+use crate::root_timeline::RootTimeline;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
 use crate::string::{AvmString, AvmStringInterner, StringContext};
@@ -869,6 +870,41 @@ impl Player {
                 StageDisplayState::Normal
             };
             context.stage.set_display_state(context, display_state);
+        });
+    }
+
+    /// Returns the scenes, frame labels and playhead position of the root movie clip,
+    /// or `None` if the root isn't a movie clip (e.g. nothing is loaded yet).
+    pub fn root_timeline(&mut self) -> Option<RootTimeline> {
+        self.mutate_with_update_context(|context| {
+            context
+                .stage
+                .root_clip()
+                .and_then(|root| root.as_movie_clip())
+                .map(RootTimeline::from_movie_clip)
+        })
+    }
+
+    /// Moves the playhead of the root movie clip to the given 1-based frame and plays
+    /// from there, as if the movie called `gotoAndPlay(frame)` on its root timeline.
+    ///
+    /// Use the `start` of a scene from [`Player::root_timeline`] to jump to that scene.
+    pub fn goto_and_play_root_frame(&mut self, frame: u16) {
+        self.mutate_with_update_context(|context| {
+            if let Some(mc) = context
+                .stage
+                .root_clip()
+                .and_then(|root| root.as_movie_clip())
+            {
+                mc.set_programmatically_played();
+                let goto_info = GotoInfo {
+                    frame,
+                    stop_or_play: StopOrPlay::Play,
+                };
+
+                mc.goto_frame(context, goto_info);
+                Self::run_actions(context);
+            }
         });
     }
 

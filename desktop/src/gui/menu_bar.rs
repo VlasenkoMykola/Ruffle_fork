@@ -3,7 +3,10 @@ use crate::gui::dialogs::Dialogs;
 use crate::gui::{DebugMessage, text};
 use crate::player::LaunchOptions;
 use crate::preferences::GlobalPreferences;
-use egui::{Button, Key, KeyboardShortcut, Modifiers, Widget};
+use egui::containers::menu::{MenuButton, MenuConfig};
+use egui::{
+    Button, DragValue, Key, KeyboardShortcut, Modifiers, PopupCloseBehavior, ScrollArea, Widget,
+};
 use ruffle_core::config::Letterbox;
 use ruffle_core::focus_tracker::DisplayObject;
 use ruffle_core::{Player, StageScaleMode};
@@ -20,6 +23,9 @@ pub struct MenuBar {
 
     cached_recents: Option<Vec<Recent>>,
     pub currently_opened: Option<(ContentDescriptor, LaunchOptions)>,
+
+    /// The frame typed into the Scenes menu's "Go to frame" field while the menu is open.
+    goto_frame_input: Option<u16>,
 }
 
 impl MenuBar {
@@ -33,6 +39,9 @@ impl MenuBar {
     const SHORTCUT_STEP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Space);
     const SHORTCUT_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
 
+    /// Lists of scenes and frame labels scroll past this height.
+    const SCENES_MENU_LIST_HEIGHT: f32 = 400.0;
+
     pub fn new(
         event_loop: EventLoopProxy<RuffleEvent>,
         default_launch_options: LaunchOptions,
@@ -44,6 +53,7 @@ impl MenuBar {
             cached_recents: None,
             currently_opened: None,
             preferences,
+            goto_frame_input: None,
         }
     }
 
@@ -102,6 +112,7 @@ impl MenuBar {
                 self.file_menu(locale, ui, dialogs, player.is_some());
                 self.view_menu(locale, ui, &mut player);
                 self.controls_menu(locale, ui, dialogs, &mut player);
+                self.scenes_menu(locale, ui, &mut player);
                 ui.menu_button( text(locale, "bookmarks-menu"), |ui| {
                     if Button::new(text(locale, "bookmarks-menu-add")).ui(ui).clicked() {
                         ui.close();
@@ -493,6 +504,118 @@ impl MenuBar {
                 ui.close();
             }
         });
+    }
+
+    fn scenes_menu(
+        &mut self,
+        locale: &LanguageIdentifier,
+        ui: &mut egui::Ui,
+        player: &mut Option<&mut Player>,
+    ) {
+        // Every item closes the menu itself, so that clicking into the
+        // "Go to frame" field doesn't close it before anything is typed.
+        let config = MenuConfig::find(ui).close_behavior(PopupCloseBehavior::CloseOnClickOutside);
+        let (_, menu_response) = MenuButton::new(text(locale, "scenes-menu"))
+            .config(config)
+            .ui(ui, |ui| {
+                let Some(timeline) = player.as_mut().and_then(|player| player.root_timeline())
+                else {
+                    ui.add_enabled(false, Button::new(text(locale, "scenes-menu-no-scenes")));
+                    return;
+                };
+
+                let mut goto_frame = None;
+                let current_scene = timeline.current_scene();
+
+                if timeline.scenes.is_empty() {
+                    ui.add_enabled(false, Button::new(text(locale, "scenes-menu-no-scenes")));
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("scenes")
+                        .max_height(Self::SCENES_MENU_LIST_HEIGHT)
+                        .show(ui, |ui| {
+                            for (index, scene) in timeline.scenes.iter().enumerate() {
+                                let button = Button::new(&scene.name)
+                                    .selected(current_scene == Some(index))
+                                    .shortcut_text(format!("{}–{}", scene.start, scene.end()));
+                                if ui
+                                    .add_enabled(timeline.is_frame_loaded(scene.start), button)
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    goto_frame = Some(scene.start);
+                                }
+                            }
+                        });
+                }
+                ui.separator();
+
+                for (id, scene) in [
+                    ("scenes-menu-previous", timeline.previous_scene()),
+                    ("scenes-menu-next", timeline.next_scene()),
+                ] {
+                    let scene = scene.filter(|scene| timeline.is_frame_loaded(scene.start));
+                    if ui
+                        .add_enabled(scene.is_some(), Button::new(text(locale, id)))
+                        .clicked()
+                    {
+                        ui.close();
+                        goto_frame = scene.map(|scene| scene.start);
+                    }
+                }
+                ui.separator();
+
+                ui.menu_button(text(locale, "scenes-menu-labels"), |ui| {
+                    if timeline.labels.is_empty() {
+                        ui.add_enabled(false, Button::new(text(locale, "scenes-menu-no-labels")));
+                        return;
+                    }
+                    ScrollArea::vertical()
+                        .id_salt("labels")
+                        .max_height(Self::SCENES_MENU_LIST_HEIGHT)
+                        .show(ui, |ui| {
+                            for label in &timeline.labels {
+                                let button =
+                                    Button::new(&label.name).shortcut_text(label.frame.to_string());
+                                if ui
+                                    .add_enabled(timeline.is_frame_loaded(label.frame), button)
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    goto_frame = Some(label.frame);
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label(text(locale, "scenes-menu-frame"));
+                    let input = self.goto_frame_input.get_or_insert(timeline.current_frame);
+                    let response = ui.add(
+                        DragValue::new(input)
+                            .range(1..=timeline.frames_loaded.max(1))
+                            .suffix(format!(" / {}", timeline.total_frames)),
+                    );
+                    let entered =
+                        response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+                    if ui.button(text(locale, "scenes-menu-go")).clicked() || entered {
+                        ui.close();
+                        goto_frame = Some(*input);
+                    }
+                });
+
+                if let Some(frame) = goto_frame
+                    && let Some(player) = player
+                {
+                    player.goto_and_play_root_frame(frame);
+                }
+            });
+
+        // Start from the current frame again next time the menu opens.
+        if menu_response.is_none() {
+            self.goto_frame_input = None;
+        }
     }
 
     fn browse_and_open(&self, open_type: OpenType) {
