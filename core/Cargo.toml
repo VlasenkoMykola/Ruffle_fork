@@ -63,7 +63,7 @@ jpegxr = { workspace = true, optional = true }
 image = { workspace = true, features = ["tiff"] }
 enum-map = { workspace = true }
 ttf-parser = "0.25"
-num-bigint = "0.4"
+num-bigint = "0.5"
 unicode-segmentation = "1.13.3"
 id3 = "1.17.0"
 either = "1.16.0"
