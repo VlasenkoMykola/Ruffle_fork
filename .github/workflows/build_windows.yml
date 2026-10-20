@@ -1,0 +1,47 @@
+name: Build Windows
+
+# Builds the desktop app for Windows on every push to the fork's default branch,
+# and uploads it as a workflow artifact to download from the run's page.
+
+on:
+  push:
+    branches: [claude/relaxed-gauss-ymscnb]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x86_64
+    runs-on: windows-2025
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo build
+        run: cargo build --locked --package ruffle_desktop --release --features jpegxr
+        env:
+          # Link the C runtime statically, so the .exe runs without installing it.
+          RUSTFLAGS: -Ctarget-feature=+crt-static
+
+      - name: Package
+        run: |
+          mkdir package
+          cp target/release/ruffle_desktop.exe package/ruffle.exe
+          cp README.md package/README.md
+          cp LICENSE.md package/LICENSE.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ruffle-windows-x86_64
+          path: package/
