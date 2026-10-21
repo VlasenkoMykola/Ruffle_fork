@@ -10,14 +10,17 @@ use crate::display_object::{DisplayObject, MovieClip, TDisplayObject, TDisplayOb
 use crate::prelude::CharacterId;
 use crate::string::{AvmString, WStr};
 
-/// The variables of the root timeline in which games made with a certain engine keep
-/// their own list of scenes, in each version of the engine.
+/// The variables in which games made with a certain engine keep their own list of
+/// scenes, in each version of the engine. Like the other variables of the engine, they're
+/// variables of the root timeline, or of `_global` in the versions whose launcher loads
+/// its parts over itself, like Big Queen 1's (`screens`) and Evil Sorceress's
+/// (`screens_list`).
 ///
 /// Those games are a launcher movie that loads its scenes from other files, or keep
 /// each scene in a movie clip, so the root timeline has no scenes of its own. They
 /// switch scenes by calling the [`SHOW_SCENE`] function of the root timeline with the
 /// name of a scene from the list, or its number in the versions that count them.
-const SCENE_LISTS: [&str; 2] = ["Qvar", "scenelist"];
+const SCENE_LISTS: [&str; 4] = ["Qvar", "scenelist", "screens", "screens_list"];
 
 /// The function of the root timeline that switches to the scene with the given name.
 const SHOW_SCENE: &str = "setScreen";
@@ -25,9 +28,9 @@ const SHOW_SCENE: &str = "setScreen";
 /// The variable of the root timeline that holds the name of the scene being shown.
 const CURRENT_SCENE_NAME: &str = "screen_name";
 
-/// The variables of the root timeline that hold the 1-based number of the scene being
-/// shown, in the versions of the engine that have one.
-const CURRENT_SCENE_NUMBERS: [&str; 3] = ["Qpos", "pos", CURRENT_SCENE_TO_MOVE_FROM];
+/// The variables that hold the 1-based number of the scene being shown, in the versions
+/// of the engine that have one.
+const CURRENT_SCENE_NUMBERS: [&str; 4] = ["Qpos", "pos", CURRENT_SCENE_TO_MOVE_FROM, "gn"];
 
 /// The variable of the root timeline that holds the 1-based number of the scene being
 /// shown, in the version of the engine whose [`SHOW_SCENE`] moves on from that scene by
@@ -154,7 +157,7 @@ impl GameScenes {
                 })
                 .collect();
 
-            let current = match stored(object, CURRENT_SCENE_NAME, activation) {
+            let current = match variable(object, CURRENT_SCENE_NAME, activation) {
                 Value::String(name) => {
                     let name = name.to_string();
                     names.iter().position(|scene| *scene == name)
@@ -162,8 +165,8 @@ impl GameScenes {
                 _ => None,
             }
             .or_else(|| {
-                CURRENT_SCENE_NUMBERS.iter().find_map(|variable| {
-                    match stored(object, variable, activation) {
+                CURRENT_SCENE_NUMBERS.iter().find_map(|name| {
+                    match variable(object, name, activation) {
                         Value::Number(number) if number >= 1.0 && number <= names.len() as f64 => {
                             Some(number as usize - 1)
                         }
@@ -218,8 +221,8 @@ impl GameScenes {
             }
             // Hitomi's version moves on from the current scene by the number it's given, so
             // it gets how far the scene is from that one.
-            let current = stored(object, CURRENT_SCENE_TO_MOVE_FROM, activation);
-            Some(match (current, stored(object, SCENE_COUNT, activation)) {
+            let current = variable(object, CURRENT_SCENE_TO_MOVE_FROM, activation);
+            Some(match (current, variable(object, SCENE_COUNT, activation)) {
                 (Value::Number(current), _) => Value::Number(number - current),
                 (_, Value::Number(_)) => Value::Number(number),
                 _ => list.scene(index, activation),
@@ -250,6 +253,19 @@ fn stored<'gc>(
         .unwrap_or(Value::Undefined)
 }
 
+/// The value of the engine's variable `name`: the root timeline `object`'s, or else
+/// `_global`'s, without running any code.
+fn variable<'gc>(
+    object: Avm1Object<'gc>,
+    name: &str,
+    activation: &mut Activation<'_, 'gc>,
+) -> Value<'gc> {
+    match stored(object, name, activation) {
+        Value::Undefined => stored(activation.global_object(), name, activation),
+        value => value,
+    }
+}
+
 /// The scenes of a game.
 enum SceneList<'gc> {
     /// The array in one of the [`SCENE_LISTS`] variables, and how many of its scenes to read.
@@ -269,7 +285,7 @@ impl<'gc> SceneList<'gc> {
     ) -> Option<Self> {
         let array = SCENE_LISTS
             .iter()
-            .find_map(|name| match stored(object, name, activation) {
+            .find_map(|name| match variable(object, name, activation) {
                 Value::Object(list) => {
                     let length = list.length(activation).ok().filter(|length| *length > 0)?;
                     Some(Self::Array(list, length.min(MAX_GAME_SCENES)))
@@ -513,6 +529,7 @@ mod tests {
         list: &'static str,
         current: Option<&'static str>,
         show: ShowScene,
+        global: bool,
     ) -> Vec<u8> {
         let show_scene = match show {
             // screen_name = name;
@@ -544,21 +561,34 @@ mod tests {
         };
         // var <list> = ["intro", "fight", "ending"]; var <current> = 1; var screen_name;
         // function setScreen(name) { ... }
-        let mut setup = vec![
-            push(&[
-                string(list),
-                string("ending"),
-                string("fight"),
-                string("intro"),
-                Value::Int(3),
-            ]),
-            Action::InitArray,
-            Action::DefineLocal,
-            push(&[string("screen_name")]),
-            Action::DefineLocal2,
+        // With `global`, the list and the current number are `_global.<list>` and
+        // `_global.<current>`.
+        let define = |variable: &'static str, value: &[Value<'static>], array: bool| {
+            let mut define = Vec::new();
+            if global {
+                define.extend([push(&[string("_global")]), Action::GetVariable]);
+            }
+            define.push(push(&[&[string(variable)], value].concat()));
+            if array {
+                define.push(Action::InitArray);
+            }
+            define.push(if global {
+                Action::SetMember
+            } else {
+                Action::DefineLocal
+            });
+            define
+        };
+        let scenes = [
+            string("ending"),
+            string("fight"),
+            string("intro"),
+            Value::Int(3),
         ];
+        let mut setup = define(list, &scenes, true);
+        setup.extend([push(&[string("screen_name")]), Action::DefineLocal2]);
         if let Some(current) = current {
-            setup.extend([push(&[string(current), Value::Int(1)]), Action::DefineLocal]);
+            setup.extend(define(current, &[Value::Int(1)], false));
         }
         if matches!(show, ShowScene::ByNumber | ShowScene::ByStep) {
             setup.extend([push(&[string("Qfrm"), Value::Int(3)]), Action::DefineLocal]);
@@ -654,13 +684,16 @@ mod tests {
 
     #[test]
     fn navigate_game_scenes() {
-        for (list, current, show) in [
-            ("scenelist", Some("pos"), ShowScene::ByName),
-            ("Qvar", Some("Qpos"), ShowScene::ByName),
-            ("Qvar", None, ShowScene::ByNumber),
-            ("Qvar", Some("Qmod"), ShowScene::ByStep),
+        for (list, current, show, global) in [
+            ("scenelist", Some("pos"), ShowScene::ByName, false),
+            ("Qvar", Some("Qpos"), ShowScene::ByName, false),
+            ("Qvar", None, ShowScene::ByNumber, false),
+            ("Qvar", Some("Qmod"), ShowScene::ByStep, false),
+            // Big Queen 1's and Evil Sorceress's
+            ("screens", Some("Qpos"), ShowScene::ByName, true),
+            ("screens_list", Some("gn"), ShowScene::ByName, true),
         ] {
-            let player = load_swf(&game_with_scene_list(list, current, show));
+            let player = load_swf(&game_with_scene_list(list, current, show, global));
             let mut player = player.lock().unwrap();
 
             let scenes = player
@@ -720,6 +753,7 @@ mod tests {
             "scenelist",
             Some("pos"),
             ShowScene::Missing,
+            false,
         ));
         let mut player = player.lock().unwrap();
         assert!(player.root_timeline().unwrap().game_scenes.is_none());

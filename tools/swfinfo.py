@@ -246,19 +246,20 @@ def decode_actions(data, start, end):
     It follows jumps and branches, as protected SWFs put junk after jumps that
     would otherwise end the code early or be read as more code."""
     records = {}
-    pending = [start]
+    pending = [(start, start, end)]  # Where to read from, within the code of a function or not
     while pending:
-        pos = pending.pop()
-        while start <= pos < end and pos not in records:
+        pos, low, high = pending.pop()
+        # A jump out of a function's code ends the function, like reaching its end.
+        while low <= pos < high and pos not in records:
             code = data[pos]
             body, length = pos + 1, 0
             if code >= 0x80:
-                if pos + 3 > end:
+                if pos + 3 > high:
                     break
                 length = struct.unpack_from("<H", data, pos + 1)[0]
                 body = pos + 3
             next_pos = body + length
-            if next_pos > end:
+            if next_pos > high:
                 break
             records[pos] = (code, body, length)
             if code in (0x00, 0x3E, 0x2A):  # End, Return, Throw
@@ -268,16 +269,17 @@ def decode_actions(data, start, end):
                 if code == 0x99:
                     pos = target
                     continue
-                pending.append(target)
+                pending.append((target, low, high))
             elif code in (0x9B, 0x8E) and length >= 2:  # DefineFunction(2)
                 # The function's code follows, and is skipped where it's defined.
-                pending.append(next_pos)
-                pos = next_pos + struct.unpack_from("<H", data, next_pos - 2)[0]
+                function_end = min(next_pos + struct.unpack_from("<H", data, next_pos - 2)[0], high)
+                pending.append((next_pos, next_pos, function_end))
+                pos = function_end
                 continue
             elif code == 0x8F and length >= 7:  # Try: the catch and finally blocks follow
                 try_size, catch_size = struct.unpack_from("<HH", data, body + 1)
-                pending.append(next_pos + try_size)
-                pending.append(next_pos + try_size + catch_size)
+                pending.append((next_pos + try_size, low, high))
+                pending.append((next_pos + try_size + catch_size, low, high))
             pos = next_pos
     return [(offset, *records[offset]) for offset in sorted(records)]
 
@@ -1082,6 +1084,9 @@ ENGINE_VERSIONS = [
     ("Qvar", "NC2's"),
     ("scenelist", "Olympic Contest's"),
 ]
+# The lists of scenes that launchers which load their parts over themselves keep in
+# _global, with the parts' setScreen switching scenes, by the version of the engine.
+LAUNCHER_LISTS = {"screens": "Big Queen 1's", "screens_list": "Evil Sorceress's"}
 SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE = (
     "supported", "frame labels only", "unknown", "couldn't read")
 
@@ -1089,7 +1094,7 @@ SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE = (
 def game_scene_list(movie):
     """(where the code keeps it, names) of a game's own scene list, if the code has it."""
     for name, values in movie.main.arrays:
-        if name in ("Qvar", "scenelist"):
+        if name in ("Qvar", "scenelist", *LAUNCHER_LISTS):
             return f"an array in {name}, in the code of the main timeline", values
     for name, values in movie.nested.arrays:
         if name in ("Qvar", "scenelist"):
@@ -1230,6 +1235,35 @@ def describe_scenes(path):
                 print("      " + line)
 
 
+def launcher_method(path, movie):
+    """(status, description) of a launcher that keeps its scene list in _global for the parts
+    it loads over itself, if one of those parts has the code that switches scenes."""
+    lists = [(name, values) for name, values in movie.main.arrays if name in LAUNCHER_LISTS]
+    if not lists:
+        return None
+    name, scenes = lists[0]
+    folder = os.path.dirname(os.path.abspath(path))
+    # Parts are named like "parts/btmq0", or "parts/esrm" with the number added in code.
+    for string in dedupe(movie.main.strings):
+        if not re.fullmatch(r"[\w.-]+(/[\w.-]+)+", string):
+            continue
+        directory, prefix = os.path.split(os.path.join(folder, *string.split("/")))
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for part in [n for n in names if n.lower().startswith(prefix.lower())][:3]:
+            try:
+                data = open(os.path.join(directory, part), "rb").read()
+                part_movie = Movie(data) if len(data) > 8 and decompress(data) else None
+            except Exception:  # A part that can't be read doesn't make the game unreadable
+                continue
+            if part_movie and "setScreen" in part_movie.main.functions:
+                return SUPPORTED, (f"its own scene list, in {LAUNCHER_LISTS[name]} version of its "
+                                   f"engine, {len(scenes)} scenes, switched by its parts")
+    return None
+
+
 def classify(args, unsupported_only=False):
     """Prints how each game in the given folders handles its scenes, and a tally. With
     `unsupported_only`, the supported games are left out of the list."""
@@ -1284,6 +1318,8 @@ def classify(args, unsupported_only=False):
             name = os.path.basename(path)
             if isinstance(movie, Movie):
                 status, description = scene_method(movie)
+                if status == UNKNOWN:
+                    status, description = launcher_method(path, movie) or (status, description)
             elif movie is None:
                 status, description = UNREADABLE, "not a SWF"
             else:

@@ -57,10 +57,11 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
 ### How games with their own scene list are handled
 
 A movie counts as such a game when its root timeline has a `setScreen` function and an
-array in `Qvar` or `scenelist`, or, without those, exports movie clips named `screen1`,
+array in `Qvar`, `scenelist`, `screens` or `screens_list` (each looked up on the root, then
+in `_global`, like the other variables below), or, without those, exports movie clips named `screen1`,
 `screen2`... (the list is then `mainmenu`, the numbered ones in order, and the other
 `screen_*` ones, like `screen_end`). The scene being shown is the one named in
-`screen_name`, or else numbered (1-based) in `Qpos`, `pos` or `Qmod`, or else, for exported
+`screen_name`, or else numbered (1-based) in `Qpos`, `pos`, `Qmod` or `gn`, or else, for exported
 clips, the one the root's child `screen` is an instance of. To switch, core does what the
 games' own controls do: stop all sounds, show the mouse cursor, and call the root's
 `setScreen` with:
@@ -141,7 +142,16 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
   their variables in `_global`, so they survive the parts replacing the root: Big Queen 1
   sets `_global.screens` and `_global.Qpos = 1`; Evil Sorceress sets `_global.gn = 1`,
   `_global.screens_list`, `_global.screens_arr` and `_global.qfile = "parts/esrm"`, then
-  loads `qfile + "1"` into `_level0`. Core only reads the root's variables so far.
+  loads `qfile + "1"` into `_level0`. The parts' `setScreen(name)` handles a scene in
+  another part itself: Big Queen 1's sets `_root.Qscr` (and `Qset`) for its `onEnterFrame`,
+  which stops sounds, shows the mouse, sets `_global.Qpos`, and attaches the clip or loads
+  `btmq1` (scenes 5 to 8) or `btmq2` (9 to 11) over the root; Evil Sorceress's sets
+  `_global.gn`, then attaches the clip when `screens_arr` puts it in the part loaded
+  (`_root.screens_cur`), or else loads `qfile + screens_arr[i]` into `_level0`, whose
+  first frames set `Qscr = _global.gn` for its `onEnterFrame` to show. Both have the Page
+  Up/Down and M keys. Core reads their lists and current numbers from `_global` and calls
+  `setScreen` with the name; `--classify` counts their launchers as supported when the
+  parts they name have `setScreen`.
 - **Avatar The Last Airbender** and **Baka 1**: the version without a list (0 above), which
   the menu supports since it lists the exported scene clips.
 
