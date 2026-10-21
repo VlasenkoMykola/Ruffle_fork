@@ -184,7 +184,9 @@ hashed names, like `540e8d62`. Wheel of Wonder (exported `screen1` and `screen2`
 `mainmenu`), Vee Hidden in the Steam and Teenage Mutant Turtles (like Evil Sorceress), and
 The Iron Giant 2 (like Big Queen 1, with its `screens` out of numeric order and `qjumps`, a
 0-based part number per scene, for `parts/tig20`...`tig22`) work too; the user's script
-copy had called them unknown. On the user's collection,
+copy had called them unknown. So do Universal Soldier and Tripping the Rift Six
+Satisfaction (`screen_N` clips, Android `62e9ae1`), and Tsunade's Debt with frame jumps
+(Android `8043e57`), which the user still counts apart from supported games. On the user's collection,
 `--classify` found 532 of 693 games supported, 10 with frame labels only and 151 unknown,
 and 576 supported and 107 unknown after the versions above were added (`e665692b3`). After
 the user removed duplicate files: 436 games, 343 supported, 7 frame labels only, 86 unknown
