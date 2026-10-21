@@ -1366,6 +1366,10 @@ def main(args):
     unsupported_only = "--unsupported" in args or names_only
     classifying, scenes = "--classify" in args or unsupported_only, "--scenes" in args
     modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes")
+    unknown_modes = [arg for arg in args if arg.startswith("--") and arg not in modes]
+    if unknown_modes:  # It would be taken for a file name, and everything else described
+        print(f"Unknown option {unknown_modes[0]}; this version has: {', '.join(modes)}")
+        return 1
     args = [arg for arg in args if arg not in modes]
     expanded = []
     for arg in args:
