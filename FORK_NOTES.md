@@ -188,8 +188,9 @@ copy had called them unknown. On the user's collection,
 `--classify` found 532 of 693 games supported, 10 with frame labels only and 151 unknown,
 and 576 supported and 107 unknown after the versions above were added (`e665692b3`). After
 the user removed duplicate files: 436 games, 343 supported, 7 frame labels only, 86 unknown
-(before `screen_N` clips and frame jumps, `dbde61b34` and `8c99a6b68`). The user sends
-samples of the unknown ones first.
+(with `screen_N` clips, `dbde61b34`), and then, with frame jumps (`8c99a6b68`), 343
+supported, 7 frame labels only, 13 only frame jumps supported and 73 unknown. The user
+sends samples of the unknown ones first.
 
 ## Frontends
 
