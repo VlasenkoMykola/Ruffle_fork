@@ -177,6 +177,8 @@ output they paste back, since the games themselves aren't shared:
 - `--classify <folders>`: one line per game on how it handles scenes (supported, frame
   labels only, unknown, unreadable), and a tally. SWFs in a subfolder that a game names
   (like `parts/`), or named by another SWF next to them, count as its parts.
+- `--unsupported <folders>`: the same, listing only the games that aren't supported (the
+  tally still counts all of them), to find the next samples.
 - Names with `*` or `?` are expanded by the script, since the Windows command line doesn't.
 - `--scenes <files>`: for games with their own scene list, each entry with the clip the
   movie exports under that name (frames, labels, which engine functions and variables its
