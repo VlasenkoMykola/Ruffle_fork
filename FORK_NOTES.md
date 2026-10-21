@@ -166,7 +166,11 @@ Mortal Combat, Avatar, Hitomi, Big Queen 1 and 2, Evil Sorceress, Avatar The Las
 and Baka 1 (Android `030412c`, Windows `e665692b3`). Mortal Combat first did nothing, on the
 build that set `Qscr`, and many of Hitomi's choices led to the main menu until core gave
 its relative `setScreen` the difference. Avatar's and Hitomi's menus show the games' own
-hashed names, like `540e8d62`. On the user's collection,
+hashed names, like `540e8d62`. Wheel of Wonder (exported `screen1` and `screen2`, no
+`mainmenu`), Vee Hidden in the Steam and Teenage Mutant Turtles (like Evil Sorceress), and
+The Iron Giant 2 (like Big Queen 1, with its `screens` out of numeric order and `qjumps`, a
+0-based part number per scene, for `parts/tig20`...`tig22`) work too; the user's script
+copy had called them unknown. On the user's collection,
 `--classify` found 532 of 693 games supported, 10 with frame labels only and 151 unknown,
 and 576 supported and 107 unknown after the versions above were added (`e665692b3`); the
 user sends samples of the unknown ones first.

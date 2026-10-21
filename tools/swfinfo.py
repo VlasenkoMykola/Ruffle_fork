@@ -1186,7 +1186,10 @@ def describe_scenes(path):
         print(f"== {name}: not a SWF ({not_swf_kind(data)})")
         return
     m = Movie(data)
-    print(f"== {name}: {scene_method(m)[1]}")
+    status, description = scene_method(m)
+    if status == UNKNOWN:
+        status, description = launcher_method(path, m) or (status, description)
+    print(f"== {name}: [{status}] {description}")
     scene_list = game_scene_list(m)
     if scene_list:
         where, names = scene_list
