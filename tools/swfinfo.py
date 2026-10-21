@@ -7,10 +7,12 @@ For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
 code jumps to, the files the code loads (and into which target), the assets it
 imports from other files, the movie clips with frame labels or long timelines,
-and which of the other given files it mentions. Folders are read recursively.
+and which of the other given files it mentions. SWFs embedded in a file are
+described after it. Folders are read recursively.
 
-With --dump, it also lists the tags of each file and prints all of its AS1/AS2
-code, which gets long for big files.
+With --dump, it also lists the tags of each file, outlines its AS3 classes with
+what their methods use, and prints all of its AS1/AS2 code, which gets long for
+big files.
 
 Only the Python standard library is needed.
 """
@@ -44,6 +46,7 @@ END, SHOW_FRAME, DEFINE_BUTTON, DO_ACTION, PLACE_OBJECT_2 = 0, 1, 7, 12, 26
 DEFINE_BUTTON_2, DEFINE_SPRITE, FRAME_LABEL, EXPORT_ASSETS = 34, 39, 43, 56
 IMPORT_ASSETS, DO_INIT_ACTION, FILE_ATTRIBUTES, IMPORT_ASSETS_2 = 57, 59, 69, 71
 DO_ABC_DEFINE, SYMBOL_CLASS, DO_ABC, SCENE_AND_FRAME_LABELS = 72, 76, 82, 86
+DEFINE_BINARY_DATA = 87
 
 TAG_NAMES = {
     0: "End", 1: "ShowFrame", 2: "DefineShape", 4: "PlaceObject", 5: "RemoveObject",
@@ -545,6 +548,208 @@ def abc_strings(data, start, end):
         return []
 
 
+# AVM2 instructions with operands, and their operands: "u" for a variable-length
+# integer, "b" for a byte, "j" for a jump offset, "s" for a lookupswitch.
+AVM2_OPERANDS = {
+    0x04: "u", 0x05: "u", 0x06: "u", 0x08: "u", 0x1B: "s", 0x24: "b", 0x25: "u",
+    0x2C: "u", 0x2D: "u", 0x2E: "u", 0x2F: "u", 0x31: "u", 0x32: "uu", 0x40: "u",
+    0x41: "u", 0x42: "u", 0x43: "uu", 0x44: "uu", 0x45: "uu", 0x46: "uu", 0x49: "u",
+    0x4A: "uu", 0x4C: "uu", 0x4E: "uu", 0x4F: "uu", 0x53: "u", 0x55: "u", 0x56: "u",
+    0x58: "u", 0x59: "u", 0x5A: "u", 0x5D: "u", 0x5E: "u", 0x5F: "u", 0x60: "u",
+    0x61: "u", 0x62: "u", 0x63: "u", 0x65: "b", 0x66: "u", 0x68: "u", 0x6A: "u",
+    0x6C: "u", 0x6D: "u", 0x6E: "u", 0x6F: "u", 0x80: "u", 0x86: "u", 0x92: "u",
+    0x94: "u", 0xB2: "u", 0xC2: "u", 0xC3: "u", 0xEF: "bubu", 0xF0: "u", 0xF1: "u",
+    **{code: "j" for code in range(0x0C, 0x1B)},
+}
+# Instructions whose first operand is a property name: getsuper, setsuper,
+# callsuper, callproperty, constructprop, callproplex, callsupervoid,
+# callpropvoid, getdescendants, findpropstrict, findproperty, getlex,
+# setproperty, getproperty, initproperty, deleteproperty.
+AVM2_NAME_OPS = {0x04, 0x05, 0x45, 0x46, 0x4A, 0x4C, 0x4E, 0x4F, 0x59, 0x5D, 0x5E, 0x60,
+                 0x61, 0x66, 0x68, 0x6A}
+PUSH_STRING = 0x2C
+TRAIT_KINDS = {0: "var", 1: "function", 2: "get", 3: "set", 4: "class", 5: "function", 6: "const"}
+
+
+class Abc:
+    """The classes of an AS3 bytecode block, and what their methods use."""
+
+    def __init__(self, data, start):
+        reader = self.reader = Reader(data, start + 4)  # Minor and major version
+        self.data = data
+        for _ in range(max(reader.u30() - 1, 0)):  # Int pool
+            reader.u30()
+        for _ in range(max(reader.u30() - 1, 0)):  # Uint pool
+            reader.u30()
+        double_count = max(reader.u30() - 1, 0)
+        reader.pos += 8 * double_count  # Double pool
+        self.strings = [""]
+        for _ in range(max(reader.u30() - 1, 0)):
+            length = reader.u30()
+            self.strings.append(data[reader.pos:reader.pos + length].decode("utf-8", "replace"))
+            reader.pos += length
+        for _ in range(max(reader.u30() - 1, 0)):  # Namespaces
+            reader.u8()
+            reader.u30()
+        for _ in range(max(reader.u30() - 1, 0)):  # Namespace sets
+            for _ in range(reader.u30()):
+                reader.u30()
+        self.multinames = [None]
+        for _ in range(max(reader.u30() - 1, 0)):
+            kind = reader.u8()
+            if kind in (0x07, 0x0D):  # QName
+                reader.u30()
+                self.multinames.append(reader.u30())
+            elif kind in (0x0F, 0x10):  # RTQName
+                self.multinames.append(reader.u30())
+            elif kind in (0x09, 0x0E):  # Multiname
+                self.multinames.append(reader.u30())
+                reader.u30()
+            elif kind in (0x11, 0x12, 0x1B, 0x1C):  # Runtime names
+                if kind in (0x1B, 0x1C):
+                    reader.u30()
+                self.multinames.append(None)
+            elif kind == 0x1D:  # Generic type, like Vector.<int>
+                base = reader.u30()
+                self.multinames.append((base, [reader.u30() for _ in range(reader.u30())]))
+            else:
+                raise ValueError(f"unknown multiname kind {kind}")
+
+        self.methods = []  # (parameter types, parameter names, return type)
+        for _ in range(reader.u30()):
+            param_count = reader.u30()
+            return_type = reader.u30()
+            param_types = [reader.u30() for _ in range(param_count)]
+            reader.u30()  # Name
+            flags = reader.u8()
+            if flags & 0x08:  # Optional parameters
+                for _ in range(reader.u30()):
+                    reader.u30()
+                    reader.u8()
+            param_names = [reader.u30() for _ in range(param_count)] if flags & 0x80 else None
+            self.methods.append((param_types, param_names, return_type))
+        for _ in range(reader.u30()):  # Metadata
+            reader.u30()
+            for _ in range(reader.u30()):
+                reader.u30()
+                reader.u30()
+        class_count = reader.u30()
+        self.classes = []  # (name, superclass, constructor, instance traits)
+        for _ in range(class_count):
+            name, superclass, flags = reader.u30(), reader.u30(), reader.u8()
+            if flags & 0x08:  # Protected namespace
+                reader.u30()
+            for _ in range(reader.u30()):  # Interfaces
+                reader.u30()
+            constructor = reader.u30()
+            self.classes.append((name, superclass, constructor, self.read_traits()))
+        self.statics = []
+        for _ in range(class_count):
+            reader.u30()  # Class initializer
+            self.statics.append(self.read_traits())
+        for _ in range(reader.u30()):  # Scripts
+            reader.u30()
+            self.read_traits()
+        self.bodies = {}  # Method index -> (names used, strings pushed)
+        for _ in range(reader.u30()):
+            method = reader.u30()
+            for _ in range(4):  # Max stack, locals, scope depths
+                reader.u30()
+            code_length = reader.u30()
+            self.bodies[method] = self.read_code(reader.pos, reader.pos + code_length)
+            reader.pos += code_length
+            for _ in range(reader.u30()):  # Exceptions
+                for _ in range(5):
+                    reader.u30()
+            self.read_traits()
+
+    def read_traits(self):
+        reader = self.reader
+        traits = []
+        for _ in range(reader.u30()):
+            name, kind_byte = reader.u30(), reader.u8()
+            kind = kind_byte & 0x0F
+            if kind in (0, 6):  # Slot, const
+                reader.u30()
+                info = reader.u30()  # Type
+                if reader.u30():
+                    reader.u8()
+            else:  # Method, getter, setter, class, function
+                reader.u30()
+                info = reader.u30()
+            if kind_byte & 0x40:  # Metadata
+                for _ in range(reader.u30()):
+                    reader.u30()
+            traits.append((kind, name, info))
+        return traits
+
+    def read_code(self, pos, end):
+        reader = Reader(self.data, pos)
+        names, strings = [], []
+        while reader.pos < end:
+            code = reader.u8()
+            for index, operand in enumerate(AVM2_OPERANDS.get(code, "")):
+                if operand == "u":
+                    value = reader.u30()
+                    if index == 0 and code in AVM2_NAME_OPS:
+                        names.append(self.name(value))
+                    elif code == PUSH_STRING:
+                        strings.append(self.strings[value] if value < len(self.strings) else "?")
+                elif operand == "b":
+                    reader.pos += 1
+                elif operand == "j":
+                    reader.pos += 3
+                elif operand == "s":
+                    reader.pos += 3
+                    case_count = reader.u30() + 1
+                    reader.pos += 3 * case_count
+        return names, strings
+
+    def name(self, index):
+        entry = self.multinames[index] if 0 < index < len(self.multinames) else None
+        if entry is None:
+            return "*"
+        if isinstance(entry, tuple):
+            base, params = entry
+            return f"{self.name(base)}.<{', '.join(self.name(param) for param in params)}>"
+        return self.strings[entry] if entry < len(self.strings) else "?"
+
+    def signature(self, method):
+        if method >= len(self.methods):
+            return "(?)"
+        param_types, param_names, return_type = self.methods[method]
+        params = []
+        for i, param_type in enumerate(param_types):
+            param_name = self.strings[param_names[i]] if param_names else ""
+            params.append(f"{param_name or f'arg{i + 1}'}: {self.name(param_type)}")
+        return f"({', '.join(params)}): {self.name(return_type)}"
+
+    def outline(self):
+        """The classes as lines of text."""
+        lines = []
+        for (name, superclass, constructor, traits), statics in zip(self.classes, self.statics):
+            lines.append(f"class {self.name(name)} extends {self.name(superclass)}")
+            members = [("", "constructor", name, constructor, 1)]
+            members += [("", TRAIT_KINDS.get(kind, "?"), trait, info, kind) for kind, trait, info in traits]
+            members += [("static ", TRAIT_KINDS.get(kind, "?"), trait, info, kind) for kind, trait, info in statics]
+            for prefix, kind_name, trait, info, kind in members:
+                if kind in (0, 6):
+                    lines.append(f"   {prefix}{kind_name} {self.name(trait)}: {self.name(info)}")
+                    continue
+                if kind == 4:
+                    lines.append(f"   {prefix}class {self.name(trait)}")
+                    continue
+                shown = "" if kind_name == "constructor" else f" {self.name(trait)}"
+                lines.append(f"   {prefix}{kind_name}{shown}{self.signature(info)}")
+                names, strings = self.bodies.get(info, ([], []))
+                names = dedupe(name for name in names if name != "*")
+                if names:
+                    lines.append(f"      uses: {limited(names, limit=60)}")
+                if strings:
+                    lines.append(f"      strings: {limited(dedupe(strings), repr, 30)}")
+        return lines
+
+
 def limited(items, formatter=str, limit=MAX_ITEMS):
     items = list(items)
     shown = " ".join(formatter(item) for item in items[:limit])
@@ -587,8 +792,10 @@ class Timeline:
                                 code_start, code_end))
 
 
-def describe(path, display_name, other_names, dump):
-    data = open(path, "rb").read()
+def describe(path, display_name, other_names, dump, data=None):
+    """Prints what the SWF file at `path`, or the SWF `data`, has and does."""
+    if data is None:
+        data = open(path, "rb").read()
     size = f"{len(data) / 1024:.0f} KB"
     unpacked = decompress(data) if len(data) > 8 else None
     if unpacked is None:
@@ -621,7 +828,8 @@ def describe(path, display_name, other_names, dump):
     scenes, scene_labels, frame_labels, stop_frames = None, [], [], []
     main, nested, blocks = Actions(), Actions(), []
     timeline = Timeline(body, version, main, nested, blocks)
-    abc, classes = [], []
+    abc, abc_blocks, classes = [], [], []
+    symbol_names, embedded = {}, []  # Embedded: (character ID, start, end) of SWFs in binary data
     sprites = []  # (ID, frame count, labels)
     exports, imports = {}, []
     tag_counts = {}
@@ -687,11 +895,16 @@ def describe(path, display_name, other_names, dump):
             if code == DO_ABC:
                 abc_start = body.index(b"\0", start + 4) + 1  # Skip the flags and name
             abc += abc_strings(body, abc_start, end)
+            abc_blocks.append(abc_start)
         elif code == SYMBOL_CLASS:
             reader = Reader(body, start)
             for _ in range(reader.u16()):
-                reader.u16()
+                character_id = reader.u16()
                 classes.append(reader.cstring())
+                symbol_names[character_id] = classes[-1]
+        elif code == DEFINE_BINARY_DATA and end - start > 14:
+            if body[start + 6:start + 9] in (b"FWS", b"CWS", b"ZWS"):  # After the ID and 4 reserved bytes
+                embedded.append((struct.unpack_from("<H", body, start)[0], start + 6, end))
 
     # Like Flash, FrameLabel tags only count when there's no scene data.
     labels = scene_labels if scenes is not None else frame_labels
@@ -766,10 +979,21 @@ def describe(path, display_name, other_names, dump):
     if dump:
         print("   tags: " + ", ".join(f"{TAG_NAMES.get(code, code)} x{count}"
                                       for code, count in tag_counts.items()))
+        for abc_start in abc_blocks:
+            try:
+                for line in Abc(body, abc_start).outline():
+                    print("   " + line)
+            except (IndexError, ValueError, struct.error) as e:
+                print(f"   (couldn't read the AS3 classes: {type(e).__name__}: {e})")
         for title, start, end in blocks:
             print(f"   -- {title} ({end - start} bytes)")
             for line in disassemble(body, start, end):
                 print("      " + line)
+
+    # Movies often embed others to load with Loader.loadBytes(), which are described too.
+    for character_id, start, end in embedded:
+        name = symbol_names.get(character_id, f"#{character_id}")
+        describe(None, f"{display_name} > embedded {name}", other_names, dump, data=body[start:end])
 
 
 def main(args):
