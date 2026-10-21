@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Summarizes how SWF files are structured and how they load each other.
 
-Usage: python swfinfo.py <file or folder> [<file or folder> ...]
+Usage: python swfinfo.py [--dump] <file or folder> [<file or folder> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
-code jumps to, the files the code loads (and into which target), and which of
-the other given files it mentions. Folders are read recursively. Only the
-Python standard library is needed.
+code jumps to, the files the code loads (and into which target), the assets it
+imports from other files, the movie clips with frame labels or long timelines,
+and which of the other given files it mentions. Folders are read recursively.
+
+With --dump, it also lists the tags of each file and prints all of its AS1/AS2
+code, which gets long for big files.
+
+Only the Python standard library is needed.
 """
 
 import lzma
@@ -18,6 +23,9 @@ import sys
 import zlib
 
 MAX_ITEMS = 40
+MAX_CLIP_LABELS = 12
+# Movie clips with this many frames are listed even when they have no labels.
+LONG_TIMELINE = 30
 
 # Calls worth reporting, with the strings pushed for them.
 LOAD_CALLS = {
@@ -27,10 +35,74 @@ LOAD_CALLS = {
 }
 GOTO_CALLS = {"gotoAndPlay", "gotoAndStop", "nextScene", "prevScene", "nextFrame", "prevFrame"}
 
+# Strings in code that look like file names, paths or URLs.
+FILE_LIKE = re.compile(
+    r"\.(swf|jpe?g|png|gif|mp3|wav|flv|mp4|xml|txt)\b|^https?:|^\w[\w.-]*/[\w./-]*$", re.I)
+
 # Tag codes
-END, SHOW_FRAME, DO_ACTION, DEFINE_BUTTON_2, DEFINE_SPRITE = 0, 1, 12, 34, 39
-FRAME_LABEL, DO_INIT_ACTION, FILE_ATTRIBUTES, DO_ABC_DEFINE = 43, 59, 69, 72
-SYMBOL_CLASS, DO_ABC, SCENE_AND_FRAME_LABELS = 76, 82, 86
+END, SHOW_FRAME, DEFINE_BUTTON, DO_ACTION, PLACE_OBJECT_2 = 0, 1, 7, 12, 26
+DEFINE_BUTTON_2, DEFINE_SPRITE, FRAME_LABEL, EXPORT_ASSETS = 34, 39, 43, 56
+IMPORT_ASSETS, DO_INIT_ACTION, FILE_ATTRIBUTES, IMPORT_ASSETS_2 = 57, 59, 69, 71
+DO_ABC_DEFINE, SYMBOL_CLASS, DO_ABC, SCENE_AND_FRAME_LABELS = 72, 76, 82, 86
+
+TAG_NAMES = {
+    0: "End", 1: "ShowFrame", 2: "DefineShape", 4: "PlaceObject", 5: "RemoveObject",
+    6: "DefineBits", 7: "DefineButton", 8: "JPEGTables", 9: "SetBackgroundColor",
+    10: "DefineFont", 11: "DefineText", 12: "DoAction", 13: "DefineFontInfo",
+    14: "DefineSound", 15: "StartSound", 17: "DefineButtonSound", 18: "SoundStreamHead",
+    19: "SoundStreamBlock", 20: "DefineBitsLossless", 21: "DefineBitsJPEG2",
+    22: "DefineShape2", 23: "DefineButtonCxform", 24: "Protect", 26: "PlaceObject2",
+    28: "RemoveObject2", 32: "DefineShape3", 33: "DefineText2", 34: "DefineButton2",
+    35: "DefineBitsJPEG3", 36: "DefineBitsLossless2", 37: "DefineEditText",
+    39: "DefineSprite", 41: "ProductInfo", 43: "FrameLabel", 45: "SoundStreamHead2",
+    46: "DefineMorphShape", 48: "DefineFont2", 56: "ExportAssets", 57: "ImportAssets",
+    58: "EnableDebugger", 59: "DoInitAction", 60: "DefineVideoStream", 61: "VideoFrame",
+    62: "DefineFontInfo2", 63: "DebugID", 64: "EnableDebugger2", 65: "ScriptLimits",
+    66: "SetTabIndex", 69: "FileAttributes", 70: "PlaceObject3", 71: "ImportAssets2",
+    72: "DoABCDefine", 73: "DefineFontAlignZones", 74: "CSMTextSettings",
+    75: "DefineFont3", 76: "SymbolClass", 77: "Metadata", 78: "DefineScalingGrid",
+    82: "DoABC", 83: "DefineShape4", 84: "DefineMorphShape2",
+    86: "DefineSceneAndFrameLabelData", 87: "DefineBinaryData", 88: "DefineFontName",
+    89: "StartSound2", 90: "DefineBitsJPEG4", 91: "DefineFont4", 93: "EnableTelemetry",
+    94: "PlaceObject4",
+}
+
+ACTION_NAMES = {
+    0x00: "End", 0x04: "NextFrame", 0x05: "PrevFrame", 0x06: "Play", 0x07: "Stop",
+    0x08: "ToggleQuality", 0x09: "StopSounds", 0x0A: "Add", 0x0B: "Subtract",
+    0x0C: "Multiply", 0x0D: "Divide", 0x0E: "Equals", 0x0F: "Less", 0x10: "And",
+    0x11: "Or", 0x12: "Not", 0x13: "StringEquals", 0x14: "StringLength",
+    0x15: "StringExtract", 0x17: "Pop", 0x18: "ToInteger", 0x1C: "GetVariable",
+    0x1D: "SetVariable", 0x20: "SetTarget2", 0x21: "StringAdd", 0x22: "GetProperty",
+    0x23: "SetProperty", 0x24: "CloneSprite", 0x25: "RemoveSprite", 0x26: "Trace",
+    0x27: "StartDrag", 0x28: "EndDrag", 0x29: "StringLess", 0x2A: "Throw",
+    0x2B: "CastOp", 0x2C: "ImplementsOp", 0x30: "RandomNumber", 0x31: "MBStringLength",
+    0x32: "CharToAscii", 0x33: "AsciiToChar", 0x34: "GetTime", 0x35: "MBStringExtract",
+    0x36: "MBCharToAscii", 0x37: "MBAsciiToChar", 0x3A: "Delete", 0x3B: "Delete2",
+    0x3C: "DefineLocal", 0x3D: "CallFunction", 0x3E: "Return", 0x3F: "Modulo",
+    0x40: "NewObject", 0x41: "DefineLocal2", 0x42: "InitArray", 0x43: "InitObject",
+    0x44: "TypeOf", 0x45: "TargetPath", 0x46: "Enumerate", 0x47: "Add2", 0x48: "Less2",
+    0x49: "Equals2", 0x4A: "ToNumber", 0x4B: "ToString", 0x4C: "PushDuplicate",
+    0x4D: "StackSwap", 0x4E: "GetMember", 0x4F: "SetMember", 0x50: "Increment",
+    0x51: "Decrement", 0x52: "CallMethod", 0x53: "NewMethod", 0x54: "InstanceOf",
+    0x55: "Enumerate2", 0x60: "BitAnd", 0x61: "BitOr", 0x62: "BitXor", 0x63: "BitLShift",
+    0x64: "BitRShift", 0x65: "BitURShift", 0x66: "StrictEquals", 0x67: "Greater",
+    0x68: "StringGreater", 0x69: "Extends", 0x81: "GotoFrame", 0x83: "GetURL",
+    0x87: "StoreRegister", 0x88: "ConstantPool", 0x8A: "WaitForFrame", 0x8B: "SetTarget",
+    0x8C: "GotoLabel", 0x8D: "WaitForFrame2", 0x8E: "DefineFunction2", 0x8F: "Try",
+    0x94: "With", 0x96: "Push", 0x99: "Jump", 0x9A: "GetURL2", 0x9B: "DefineFunction",
+    0x9D: "If", 0x9E: "Call", 0x9F: "GotoFrame2",
+}
+
+# onClipEvent flags of PlaceObject2
+CLIP_EVENTS = [
+    (0x1, "load"), (0x2, "enterFrame"), (0x4, "unload"), (0x8, "mouseMove"),
+    (0x10, "mouseDown"), (0x20, "mouseUp"), (0x40, "keyDown"), (0x80, "keyUp"),
+    (0x100, "data"), (0x200, "initialize"), (0x400, "press"), (0x800, "release"),
+    (0x1000, "releaseOutside"), (0x2000, "rollOver"), (0x4000, "rollOut"),
+    (0x8000, "dragOver"), (0x10000, "dragOut"), (0x20000, "keyPress"), (0x40000, "construct"),
+]
+KEY_PRESS = 0x20000
 
 
 class Reader:
@@ -45,6 +117,11 @@ class Reader:
 
     def u16(self):
         value = struct.unpack_from("<H", self.data, self.pos)[0]
+        self.pos += 2
+        return value
+
+    def i16(self):
+        value = struct.unpack_from("<h", self.data, self.pos)[0]
         self.pos += 2
         return value
 
@@ -67,6 +144,44 @@ class Reader:
         value = self.data[self.pos:end].decode("utf-8", "replace")
         self.pos = end + 1
         return value
+
+
+class Bits:
+    """Reads the bit fields of matrices and color transforms."""
+
+    def __init__(self, data, pos):
+        self.data = data
+        self.pos = pos
+        self.bit = 0
+
+    def ub(self, count):
+        value = 0
+        for _ in range(count):
+            value = (value << 1) | ((self.data[self.pos] >> (7 - self.bit)) & 1)
+            self.bit += 1
+            if self.bit == 8:
+                self.bit = 0
+                self.pos += 1
+        return value
+
+    def end(self):
+        return self.pos + (1 if self.bit else 0)
+
+
+def skip_matrix(data, pos):
+    bits = Bits(data, pos)
+    for _ in range(2):  # Scale, rotation
+        if bits.ub(1):
+            bits.ub(2 * bits.ub(5))
+    bits.ub(2 * bits.ub(5))  # Translation
+    return bits.end()
+
+
+def skip_color_transform(data, pos):
+    bits = Bits(data, pos)
+    has_add, has_mult = bits.ub(1), bits.ub(1)
+    bits.ub(bits.ub(4) * 4 * (has_add + has_mult))
+    return bits.end()
 
 
 def decompress(data):
@@ -101,29 +216,120 @@ def read_tags(data, pos, end):
         pos += length
 
 
+def decode_actions(data, start, end):
+    """The action records in data[start:end] that can run, in address order, as
+    (offset, code, body_start, body_length).
+
+    It follows jumps and branches, as protected SWFs put junk after jumps that
+    would otherwise end the code early or be read as more code."""
+    records = {}
+    pending = [start]
+    while pending:
+        pos = pending.pop()
+        while start <= pos < end and pos not in records:
+            code = data[pos]
+            body, length = pos + 1, 0
+            if code >= 0x80:
+                if pos + 3 > end:
+                    break
+                length = struct.unpack_from("<H", data, pos + 1)[0]
+                body = pos + 3
+            next_pos = body + length
+            if next_pos > end:
+                break
+            records[pos] = (code, body, length)
+            if code in (0x00, 0x3E, 0x2A):  # End, Return, Throw
+                break
+            if code in (0x99, 0x9D) and length >= 2:  # Jump, If
+                target = next_pos + struct.unpack_from("<h", data, body)[0]
+                if code == 0x99:
+                    pos = target
+                    continue
+                pending.append(target)
+            elif code in (0x9B, 0x8E) and length >= 2:  # DefineFunction(2)
+                # The function's code follows, and is skipped where it's defined.
+                pending.append(next_pos)
+                pos = next_pos + struct.unpack_from("<H", data, next_pos - 2)[0]
+                continue
+            elif code == 0x8F and length >= 7:  # Try: the catch and finally blocks follow
+                try_size, catch_size = struct.unpack_from("<HH", data, body + 1)
+                pending.append(next_pos + try_size)
+                pending.append(next_pos + try_size + catch_size)
+            pos = next_pos
+    return [(offset, *records[offset]) for offset in sorted(records)]
+
+
+class Special(str):
+    """A pushed value that isn't a string, like a register or null."""
+
+    def __repr__(self):
+        return str(self)
+
+
+def push_values(data, pos, end, constants):
+    values = []
+    while pos < end:
+        kind = data[pos]
+        pos += 1
+        if kind == 0:
+            stop = data.index(b"\0", pos)
+            values.append(data[pos:stop].decode("utf-8", "replace"))
+            pos = stop + 1
+        elif kind in (1, 6):  # Float, double (stored as two words, high one first)
+            if kind == 1:
+                value = struct.unpack_from("<f", data, pos)[0]
+                pos += 4
+            else:
+                value = struct.unpack("<d", data[pos + 4:pos + 8] + data[pos:pos + 4])[0]
+                pos += 8
+            values.append(int(value) if value == value and value.is_integer() else value)
+        elif kind == 2:
+            values.append(Special("null"))
+        elif kind == 3:
+            values.append(Special("undefined"))
+        elif kind == 4:
+            values.append(Special(f"r{data[pos]}"))
+            pos += 1
+        elif kind == 5:
+            values.append(Special("true" if data[pos] else "false"))
+            pos += 1
+        elif kind == 7:
+            values.append(struct.unpack_from("<i", data, pos)[0])
+            pos += 4
+        elif kind in (8, 9):
+            if kind == 8:
+                index = data[pos]
+                pos += 1
+            else:
+                index = struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+            values.append(constants[index] if index < len(constants) else Special(f"c{index}?"))
+        else:
+            break
+    return values
+
+
 class Actions:
-    """What a block of AVM1 actions does, read without running it."""
+    """What blocks of AVM1 actions do, read without running them."""
 
     def __init__(self):
         self.stops = False
         self.gotos = []
         self.loads = []
         self.calls = []
+        self.strings = []
 
-    def scan(self, data, pos, end):
+    def merge(self, other):
+        self.stops |= other.stops
+        self.gotos += other.gotos
+        self.loads += other.loads
+        self.calls += other.calls
+        self.strings += other.strings
+
+    def scan(self, data, start, end):
         constants = []
-        recent = []  # Strings and numbers pushed lately, newest last
-        while pos < end:
-            code = data[pos]
-            pos += 1
-            if code == 0:
-                break
-            length = 0
-            if code >= 0x80:
-                if pos + 2 > end:
-                    break
-                length = struct.unpack_from("<H", data, pos)[0]
-                pos += 2
+        recent = []  # Values pushed lately, newest last
+        for _, code, pos, length in decode_actions(data, start, end):
             body = Reader(data, pos)
             try:
                 if code == 0x07:  # Stop
@@ -137,6 +343,7 @@ class Actions:
                     self.gotos.append(str(target) if isinstance(target, int) else repr(target))
                 elif code == 0x83:  # GetURL
                     url, target = body.cstring(), body.cstring()
+                    self.strings.append(url)
                     self.loads.append(f"getURL({url!r}, {target!r})")
                 elif code == 0x9A:  # GetURL2
                     args = [repr(v) for v in recent[-2:]]
@@ -144,35 +351,15 @@ class Actions:
                     recent = []
                 elif code == 0x88:  # ConstantPool
                     constants = [body.cstring() for _ in range(body.u16())]
+                    self.strings += constants
                 elif code == 0x96:  # Push
-                    while body.pos < pos + length:
-                        kind = body.u8()
-                        if kind == 0:
-                            recent.append(body.cstring())
-                        elif kind == 1:
-                            body.pos += 4
-                        elif kind in (2, 3):
-                            pass
-                        elif kind in (4, 5):
-                            body.pos += 1
-                        elif kind == 6:
-                            body.pos += 8
-                        elif kind == 7:
-                            recent.append(struct.unpack_from("<i", data, body.pos)[0])
-                            body.pos += 4
-                        elif kind == 8:
-                            index = body.u8()
-                            recent.append(constants[index] if index < len(constants) else "?")
-                        elif kind == 9:
-                            index = body.u16()
-                            recent.append(constants[index] if index < len(constants) else "?")
-                        else:
-                            break
-                    recent = recent[-8:]
+                    values = push_values(data, pos, pos + length, constants)
+                    self.strings += [v for v in values if type(v) is str]
+                    recent = (recent + values)[-8:]
                 elif code in (0x52, 0x3D):  # CallMethod, CallFunction
-                    if recent and isinstance(recent[-1], str):
+                    if recent and type(recent[-1]) is str:
                         name = recent[-1]
-                        args = [repr(v) for v in recent[:-1] if isinstance(v, str)][-3:]
+                        args = [repr(v) for v in recent[:-1] if type(v) is str][-3:]
                         call = f"{name}({', '.join(args)})"
                         if name in LOAD_CALLS:
                             self.loads.append(call)
@@ -183,22 +370,131 @@ class Actions:
                     recent = []
             except (IndexError, ValueError, struct.error):
                 pass
-            pos += length
 
 
-def scan_button_2(data, start, end, actions):
+def disassemble(data, start, end):
+    """The actions in data[start:end] as lines of text."""
+    constants = []
+    lines = []
+    for offset, code, pos, length in decode_actions(data, start, end):
+        body = Reader(data, pos)
+        args = ""
+        try:
+            if code == 0x88:
+                constants = [body.cstring() for _ in range(body.u16())]
+                args = " ".join(f"c{i}={c!r}" for i, c in enumerate(constants))
+            elif code == 0x96:
+                args = ", ".join(repr(v) for v in push_values(data, pos, pos + length, constants))
+            elif code == 0x81:
+                args = str(body.u16() + 1)
+            elif code in (0x8C, 0x8B):  # GotoLabel, SetTarget
+                args = repr(body.cstring())
+            elif code == 0x83:
+                args = f"{body.cstring()!r} target={body.cstring()!r}"
+            elif code in (0x99, 0x9D):
+                args = f"-> {pos + length + body.i16() - start:04x}"
+            elif code == 0x9B:
+                name = body.cstring()
+                params = [body.cstring() for _ in range(body.u16())]
+                args = f"{name or '(anonymous)'}({', '.join(params)}) code {body.u16()} bytes"
+            elif code == 0x8E:
+                name = body.cstring()
+                param_count = body.u16()
+                body.u8()  # Register count
+                body.u16()  # Flags
+                params = []
+                for _ in range(param_count):
+                    register = body.u8()
+                    params.append(body.cstring() + (f"=r{register}" if register else ""))
+                args = f"{name or '(anonymous)'}({', '.join(params)}) code {body.u16()} bytes"
+            elif code == 0x87:
+                args = f"r{body.u8()}"
+            elif code == 0x9F:
+                flags = body.u8()
+                args = ("play" if flags & 1 else "stop") + (f" scene bias {body.u16()}" if flags & 2 else "")
+            elif code == 0x9A:
+                flags = body.u8()
+                kinds = ["loadVariables" if flags & 0x80 else "", "into clip" if flags & 0x40 else ""]
+                method = ["", "GET", "POST", "?"][flags & 3]
+                args = " ".join(k for k in kinds + [method] if k)
+            elif code == 0x8A:
+                args = f"frame {body.u16() + 1} else skip {body.u8()}"
+            elif code == 0x8D:
+                args = f"else skip {body.u8()}"
+            elif code == 0x94:
+                args = f"{body.u16()} bytes"
+            elif code == 0x8F:
+                body.u8()
+                args = "try {} catch {} finally {} bytes".format(body.u16(), body.u16(), body.u16())
+        except (IndexError, ValueError, struct.error):
+            args = "(unreadable)"
+        name = ACTION_NAMES.get(code, f"Unknown 0x{code:02X}")
+        lines.append(f"{offset - start:04x} {name} {args}".rstrip())
+    return lines
+
+
+def button_1_actions(data, start, end):
+    pos = start + 2  # Button ID
+    while pos < end and data[pos]:  # Button records end with a 0
+        pos = skip_matrix(data, pos + 5)  # Flags, character ID, depth
+    return [(pos + 1, end)]
+
+
+def button_2_actions(data, start, end):
     reader = Reader(data, start + 3)  # Button ID, flags
     offset_pos = reader.pos
     offset = reader.u16()
     if offset == 0:
-        return
+        return []
     pos = offset_pos + offset
+    blocks = []
     while pos + 4 <= end:
         size = struct.unpack_from("<H", data, pos)[0]
-        actions.scan(data, pos + 4, pos + size if size else end)
+        blocks.append((pos + 4, pos + size if size else end))
         if size == 0:
             break
         pos += size
+    return blocks
+
+
+def clip_actions(data, start, end, version):
+    """(depth, event names, start, end) of the onClipEvent handlers in a PlaceObject2 tag."""
+    flags = data[start]
+    if not flags & 0x80:
+        return []
+    reader = Reader(data, start + 1)
+    depth = reader.u16()
+    if flags & 0x02:
+        reader.u16()  # Character ID
+    if flags & 0x04:
+        reader.pos = skip_matrix(data, reader.pos)
+    if flags & 0x08:
+        reader.pos = skip_color_transform(data, reader.pos)
+    if flags & 0x10:
+        reader.u16()  # Ratio
+    if flags & 0x20:
+        reader.cstring()  # Name
+    if flags & 0x40:
+        reader.u16()  # Clip depth
+    read_events = reader.u32 if version >= 6 else reader.u16
+    reader.u16()  # Reserved
+    read_events()  # All events
+    handlers = []
+    try:
+        while reader.pos < end:
+            events = read_events()
+            if not events:
+                break
+            size = reader.u32()
+            actions_start = reader.pos
+            reader.pos += size
+            if events & KEY_PRESS:
+                actions_start += 1  # Key code
+            names = "/".join(name for bit, name in CLIP_EVENTS if events & bit)
+            handlers.append((depth, names, actions_start, min(reader.pos, end)))
+    except struct.error:  # Cut off, which Flash Player tolerates
+        pass
+    return handlers
 
 
 def abc_strings(data, start, end):
@@ -220,17 +516,49 @@ def abc_strings(data, start, end):
         return []
 
 
-def limited(items, formatter=str):
+def limited(items, formatter=str, limit=MAX_ITEMS):
     items = list(items)
-    shown = " ".join(formatter(item) for item in items[:MAX_ITEMS])
-    return shown + (f" ... (+{len(items) - MAX_ITEMS} more)" if len(items) > MAX_ITEMS else "")
+    shown = " ".join(formatter(item) for item in items[:limit])
+    return shown + (f" ... (+{len(items) - limit} more)" if len(items) > limit else "")
 
 
 def dedupe(items):
     return list(dict.fromkeys(items))
 
 
-def describe(path, display_name, other_names):
+def format_labels(labels, limit=MAX_ITEMS):
+    return limited(labels, lambda label: f"{label[0]}:{label[1]!r}", limit)
+
+
+class Timeline:
+    """Scans the code of a timeline and of the clips placed on it."""
+
+    def __init__(self, data, version, frame_actions, nested, blocks):
+        self.data = data
+        self.version = version
+        self.frame_actions = frame_actions  # Where the code of its frames goes
+        self.nested = nested  # Where the code of clips placed on it goes
+        self.blocks = blocks  # (title, start, end) of each block of code, for --dump
+
+    def frame_code(self, title, start, end):
+        actions = Actions()
+        actions.scan(self.data, start, end)
+        self.frame_actions.merge(actions)
+        self.blocks.append((title, start, end))
+        return actions
+
+    def placed_code(self, where, start, end):
+        try:
+            handlers = clip_actions(self.data, start, end, self.version)
+        except (IndexError, ValueError, struct.error):
+            return
+        for depth, events, code_start, code_end in handlers:
+            self.nested.scan(self.data, code_start, code_end)
+            self.blocks.append((f"{where}, onClipEvent({events}) of the clip at depth {depth}",
+                                code_start, code_end))
+
+
+def describe(path, display_name, other_names, dump):
     data = open(path, "rb").read()
     size = f"{len(data) / 1024:.0f} KB"
     unpacked = decompress(data) if len(data) > 8 else None
@@ -262,13 +590,15 @@ def describe(path, display_name, other_names):
 
     as3 = False
     scenes, scene_labels, frame_labels, stop_frames = None, [], [], []
-    main = Actions()
-    nested = Actions()
-    abc = []
-    classes = []
-    sprite_count = 0
+    main, nested, blocks = Actions(), Actions(), []
+    timeline = Timeline(body, version, main, nested, blocks)
+    abc, classes = [], []
+    sprites = []  # (ID, frame count, labels)
+    exports, imports = {}, []
+    tag_counts = {}
     frame = 1
     for code, start, end in read_tags(body, pos, len(body)):
+        tag_counts[code] = tag_counts.get(code, 0) + 1
         if code == SHOW_FRAME:
             frame += 1
         elif code == FILE_ATTRIBUTES and start < end:
@@ -280,22 +610,49 @@ def describe(path, display_name, other_names):
             scenes = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
             scene_labels = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
         elif code == DO_ACTION:
-            frame_actions = Actions()
-            frame_actions.scan(body, start, end)
-            if frame_actions.stops:
+            if timeline.frame_code(f"frame {frame}", start, end).stops:
                 stop_frames.append(frame)
-            main.gotos += frame_actions.gotos
-            main.loads += frame_actions.loads
-            main.calls += frame_actions.calls
+        elif code == PLACE_OBJECT_2:
+            timeline.placed_code(f"frame {frame}", start, end)
         elif code == DO_INIT_ACTION:
+            sprite_id = struct.unpack_from("<H", body, start)[0]
             nested.scan(body, start + 2, end)
-        elif code == DEFINE_BUTTON_2:
-            scan_button_2(body, start, end, nested)
+            blocks.append((f"#initclip of clip #{sprite_id}", start + 2, end))
+        elif code in (DEFINE_BUTTON, DEFINE_BUTTON_2):
+            button_id = struct.unpack_from("<H", body, start)[0]
+            find = button_1_actions if code == DEFINE_BUTTON else button_2_actions
+            for block_start, block_end in find(body, start, end):
+                nested.scan(body, block_start, block_end)
+                blocks.append((f"button #{button_id}", block_start, block_end))
         elif code == DEFINE_SPRITE:
-            sprite_count += 1
+            sprite_id, sprite_frames = struct.unpack_from("<HH", body, start)
+            sprite = Timeline(body, version, nested, nested, blocks)
+            labels, sub_frame = [], 1
             for sub_code, sub_start, sub_end in read_tags(body, start + 4, end):
-                if sub_code == DO_ACTION:
-                    nested.scan(body, sub_start, sub_end)
+                if sub_code == SHOW_FRAME:
+                    sub_frame += 1
+                elif sub_code == FRAME_LABEL:
+                    labels.append((sub_frame, Reader(body, sub_start).cstring()))
+                elif sub_code == DO_ACTION:
+                    sprite.frame_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
+                elif sub_code == PLACE_OBJECT_2:
+                    sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
+            sprites.append((sprite_id, sprite_frames, labels))
+        elif code == EXPORT_ASSETS:
+            reader = Reader(body, start)
+            for _ in range(reader.u16()):
+                character_id = reader.u16()
+                exports[character_id] = reader.cstring()
+        elif code in (IMPORT_ASSETS, IMPORT_ASSETS_2):
+            reader = Reader(body, start)
+            url = reader.cstring()
+            if code == IMPORT_ASSETS_2:
+                reader.u16()  # Reserved
+            names = []
+            for _ in range(reader.u16()):
+                reader.u16()
+                names.append(reader.cstring())
+            imports.append((url, names))
         elif code in (DO_ABC, DO_ABC_DEFINE):
             abc_start = start
             if code == DO_ABC:
@@ -311,21 +668,40 @@ def describe(path, display_name, other_names):
     labels = scene_labels if scenes is not None else frame_labels
     scenes = scenes or []
     print(f"== {display_name}  ({size}, {signature} v{version}, {'AS3' if as3 else 'AS1/AS2'}, "
-          f"{width}x{height} @ {frame_rate:g} fps, {frame_count} frames, {sprite_count} sprites)")
+          f"{width}x{height} @ {frame_rate:g} fps, {frame_count} frames, {len(sprites)} sprites)")
     print("   scenes: " + (limited(scenes, lambda s: f"{s[0]}:{s[1]!r}") if scenes else "none"))
-    print(f"   labels ({len(labels)}): " + (limited(labels, lambda l: f"{l[0]}:{l[1]!r}") or "none"))
+    print(f"   labels ({len(labels)}): " + (format_labels(labels) or "none"))
     print(f"   main timeline stops at frames ({len(stop_frames)}): " + (limited(stop_frames) or "none"))
     for title, items in (
         ("main timeline goes to", main.gotos),
         ("main timeline calls", main.calls),
         ("main timeline loads", main.loads),
-        ("sprites/buttons go to", nested.gotos),
-        ("sprites/buttons call", nested.calls),
-        ("sprites/buttons load", nested.loads),
+        ("clips/buttons go to", nested.gotos),
+        ("clips/buttons call", nested.calls),
+        ("clips/buttons load", nested.loads),
     ):
         items = dedupe(items)
         if items:
             print(f"   {title} ({len(items)}): {limited(items)}")
+    for url, names in imports:
+        print(f"   imports from {url!r} ({len(names)}): {limited(names, repr)}")
+    file_like = [s for s in dedupe(main.strings + nested.strings)
+                 if len(s) <= 120 and not re.search("[<>\"']", s) and FILE_LIKE.search(s)]
+    if file_like:
+        print(f"   file names in code ({len(file_like)}): {limited(file_like, repr)}")
+
+    clips = sorted((s for s in sprites if s[2] or s[1] >= LONG_TIMELINE), key=lambda s: -s[1])
+    if clips:
+        print(f"   clips with labels or {LONG_TIMELINE}+ frames ({len(clips)}):")
+        for sprite_id, sprite_frames, sprite_labels in clips[:MAX_ITEMS]:
+            name = f" {exports[sprite_id]!r}" if sprite_id in exports else ""
+            label_text = f", labels {format_labels(sprite_labels, MAX_CLIP_LABELS)}" if sprite_labels else ""
+            print(f"      #{sprite_id}{name}: {sprite_frames} frames{label_text}")
+        if len(clips) > MAX_ITEMS:
+            print(f"      ... (+{len(clips) - MAX_ITEMS} more)")
+    if exports:
+        print(f"   exported symbols ({len(exports)}): {limited(exports.values(), repr)}")
+
     if classes:
         print(f"   AS3 classes ({len(classes)}): {limited(dedupe(classes), repr)}")
     if abc:
@@ -344,11 +720,25 @@ def describe(path, display_name, other_names):
     if mentioned:
         print(f"   mentions other files ({len(mentioned)}): {limited(mentioned)}")
 
+    if dump:
+        print("   tags: " + ", ".join(f"{TAG_NAMES.get(code, code)} x{count}"
+                                      for code, count in tag_counts.items()))
+        for title, start, end in blocks:
+            print(f"   -- {title} ({end - start} bytes)")
+            for line in disassemble(body, start, end):
+                print("      " + line)
+
 
 def main(args):
+    dump = "--dump" in args
+    args = [arg for arg in args if arg != "--dump"]
     if not args:
         print(__doc__)
         return 1
+    try:  # Don't fail on names in other alphabets when the output goes to a file
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except AttributeError:
+        pass
     files = []
     for arg in args:
         if os.path.isdir(arg):
@@ -362,7 +752,7 @@ def main(args):
     names = [name for _, name in files]
     for path, name in files:
         try:
-            describe(path, name, names)
+            describe(path, name, names, dump)
         except Exception as e:  # Keep going, so one odd file doesn't hide the rest
             print(f"== {name}  (couldn't read: {type(e).__name__}: {e})")
     return 0
