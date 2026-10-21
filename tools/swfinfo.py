@@ -1087,7 +1087,10 @@ def game_scene_list(movie):
     """(where the code keeps it, names) of a game's own scene list, if the code has it."""
     for name, values in movie.main.arrays:
         if name in ("Qvar", "scenelist"):
-            return f"an array in {name}", values
+            return f"an array in {name}, in the code of the main timeline", values
+    for name, values in movie.nested.arrays:
+        if name in ("Qvar", "scenelist"):
+            return f"an array in {name}, set by the code of a clip", values
     # Some versions split a string of the scene names, which are exported symbols (which
     # Flash looks up ignoring case). Take the one naming the most.
     exported = {name.lower() for name in movie.exports.values()}
@@ -1098,7 +1101,7 @@ def game_scene_list(movie):
         if len(names) > 1 and count > best_count:
             best, best_count = names, count
     if best:
-        return "a string of names separated by commas", best
+        return "a string of names separated by commas, in the code of the main timeline", best
     return None
 
 
@@ -1111,6 +1114,8 @@ def scene_count(movie):
 def scene_method(movie):
     """How a movie handles its scenes, as (status, description)."""
     strings = set(movie.main.strings)
+    # Some games set the list from the code of a clip, like Big Queen 2, which the menu finds too.
+    strings |= {name for name, _ in movie.nested.arrays if name in ("Qvar", "scenelist")}
     if "setScreen" in movie.main.functions and strings & {"Qvar", "scenelist"}:
         version = next(version for variable, version in ENGINE_VERSIONS if variable in strings)
         count = scene_count(movie)
@@ -1146,7 +1151,7 @@ def describe_scenes(path):
     scene_list = game_scene_list(m)
     if scene_list:
         where, names = scene_list
-        print(f"   the list ({len(names)} scenes) is {where} in the code of the main timeline")
+        print(f"   the list ({len(names)} scenes) is {where}")
         if "Qfrm" not in m.main.strings:
             print("   its scenes are in the parts it loads, so this file can't tell more about them: "
                   + limited(names, repr))

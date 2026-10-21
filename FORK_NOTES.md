@@ -105,8 +105,9 @@ What's known about each, from `tools/swfinfo.py` dumps:
 Unknown to `--classify`, but of the same developer (samples sent so far):
 
 - **Big Queen 2**: a launcher of the `Qvar` version (12 scenes, `socket`, `parts/mq2`), whose
-  `Qvar` array is set by code in a clip, which `--classify` doesn't look at. Whether the menu
-  finds it depends on where that code puts it.
+  `Qvar` array is set by code in a clip. The menu works in it (tested), so `--classify` now
+  counts lists set from a clip's code as supported. Big Queen 1 and Evil Sorceress don't work
+  yet.
 - **Big Queen 1** and **Evil Sorceress**: launchers that load their first part over
   themselves (`loadMovie("parts/btmq0", this)`, and into `_level0` from `parts/esrm`), so
   the game's code is in the parts. Their arrays are like the `scenelist` version's, with
