@@ -28,7 +28,9 @@ minimal. These notes keep what was learned while making it.
   tests (API 26 and 36) pass, its `Publish` job (`publish_build.yml`, through
   `workflow_call`) replaces the pre-release `latest-build`:
   https://github.com/VlasenkoMykola/ruffle-android-with-sceneselect/releases/tag/latest-build.
-  Its notes name the commit it was built from, which is how to tell builds apart.
+  Its notes name the commit it was built from, which is how to tell builds apart. Each APK
+  is also its own unzipped artifact of the run, since the user's connection is slow and they
+  only need `app-arm64-v8a-release.apk`.
 - Workflow artifacts are unreliable to download for the user, hence the releases.
 - From the cloud sessions this was made in: pushing tags is refused (only branches can be
   pushed); `dl.google.com`, Termux mirrors and the artifact storage are blocked, so Android
