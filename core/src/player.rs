@@ -50,7 +50,7 @@ use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
 use crate::orphan_manager::OrphanManager;
 use crate::prelude::*;
-use crate::root_timeline::RootTimeline;
+use crate::root_timeline::{GameScenes, RootTimeline};
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
 use crate::string::{AvmString, AvmStringInterner, StringContext};
@@ -877,12 +877,21 @@ impl Player {
     /// or `None` if the root isn't a movie clip (e.g. nothing is loaded yet).
     pub fn root_timeline(&mut self) -> Option<RootTimeline> {
         self.mutate_with_update_context(|context| {
-            context
-                .stage
-                .root_clip()
-                .and_then(|root| root.as_movie_clip())
-                .map(RootTimeline::from_movie_clip)
+            let root = context.stage.root_clip()?;
+            let mut timeline = RootTimeline::from_movie_clip(root.as_movie_clip()?);
+            timeline.game_scenes = GameScenes::read(context, root);
+            Some(timeline)
         })
+    }
+
+    /// Makes a game that keeps its own list of scenes switch to the scene at `index`
+    /// in [`RootTimeline::game_scenes`], the way its own controls do.
+    pub fn goto_game_scene(&mut self, index: usize) {
+        self.mutate_with_update_context(|context| {
+            if let Some(root) = context.stage.root_clip() {
+                GameScenes::request(context, root, index);
+            }
+        });
     }
 
     /// Moves the playhead of the root movie clip to the given 1-based frame and plays

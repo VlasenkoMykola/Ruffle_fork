@@ -525,9 +525,32 @@ impl MenuBar {
                 };
 
                 let mut goto_frame = None;
+                let mut goto_game_scene = None;
                 let current_scene = timeline.current_scene();
+                // Games that keep their own list of scenes are navigated with it.
+                let game_scenes = timeline
+                    .game_scenes
+                    .as_ref()
+                    .filter(|scenes| !scenes.names.is_empty());
 
-                if timeline.scenes.is_empty() {
+                if let Some(game_scenes) = game_scenes {
+                    ScrollArea::vertical()
+                        .id_salt("game-scenes")
+                        .max_height(Self::SCENES_MENU_LIST_HEIGHT)
+                        .show(ui, |ui| {
+                            for (index, name) in game_scenes.names.iter().enumerate() {
+                                let number = (index + 1).to_string();
+                                let name = if name.is_empty() { &number } else { name };
+                                let button = Button::new(name)
+                                    .selected(game_scenes.current == Some(index))
+                                    .shortcut_text(number.as_str());
+                                if ui.add(button).clicked() {
+                                    ui.close();
+                                    goto_game_scene = Some(index);
+                                }
+                            }
+                        });
+                } else if timeline.scenes.is_empty() {
                     ui.add_enabled(false, Button::new(text(locale, "scenes-menu-no-scenes")));
                 } else {
                     ScrollArea::vertical()
@@ -550,17 +573,32 @@ impl MenuBar {
                 }
                 ui.separator();
 
-                for (id, scene) in [
-                    ("scenes-menu-previous", timeline.previous_scene()),
-                    ("scenes-menu-next", timeline.next_scene()),
-                ] {
-                    let scene = scene.filter(|scene| timeline.is_frame_loaded(scene.start));
-                    if ui
-                        .add_enabled(scene.is_some(), Button::new(text(locale, id)))
-                        .clicked()
-                    {
-                        ui.close();
-                        goto_frame = scene.map(|scene| scene.start);
+                if let Some(game_scenes) = game_scenes {
+                    for (id, index) in [
+                        ("scenes-menu-previous", game_scenes.previous()),
+                        ("scenes-menu-next", game_scenes.next()),
+                    ] {
+                        if ui
+                            .add_enabled(index.is_some(), Button::new(text(locale, id)))
+                            .clicked()
+                        {
+                            ui.close();
+                            goto_game_scene = index;
+                        }
+                    }
+                } else {
+                    for (id, scene) in [
+                        ("scenes-menu-previous", timeline.previous_scene()),
+                        ("scenes-menu-next", timeline.next_scene()),
+                    ] {
+                        let scene = scene.filter(|scene| timeline.is_frame_loaded(scene.start));
+                        if ui
+                            .add_enabled(scene.is_some(), Button::new(text(locale, id)))
+                            .clicked()
+                        {
+                            ui.close();
+                            goto_frame = scene.map(|scene| scene.start);
+                        }
                     }
                 }
                 ui.separator();
@@ -609,6 +647,11 @@ impl MenuBar {
                     && let Some(player) = player
                 {
                     player.goto_and_play_root_frame(frame);
+                }
+                if let Some(index) = goto_game_scene
+                    && let Some(player) = player
+                {
+                    player.goto_game_scene(index);
                 }
             });
 

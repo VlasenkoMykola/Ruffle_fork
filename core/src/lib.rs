@@ -64,7 +64,7 @@ pub use events::PlayerEvent;
 pub use indexmap;
 pub use loader::LoadBehavior;
 pub use player::{Player, PlayerBuilder, PlayerMode, PlayerRuntime, StaticCallstack};
-pub use root_timeline::RootTimeline;
+pub use root_timeline::{GameScenes, RootTimeline};
 pub use ruffle_common::duration::FloatDuration;
 pub use ruffle_render::backend::ViewportDimensions;
 pub use swf;
