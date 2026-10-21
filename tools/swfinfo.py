@@ -2,6 +2,7 @@
 """Summarizes how SWF files are structured and how they load each other.
 
 Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folder> ...]
+       python swfinfo.py --classify <folder> [<folder> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
@@ -14,6 +15,12 @@ With --dump, it also lists the tags of each file, outlines its AS3 classes with
 what their methods use, and prints all of its AS1/AS2 code, which gets long for
 big files. --dump-main prints only the code of the main timeline, which is enough
 to see how many games move between their scenes.
+
+--classify goes through folders of games instead, and prints for each game how it
+handles its scenes: in one of the ways Ruffle's scene menu supports, with frame
+labels only, or in a way it doesn't know yet. SWFs in a subfolder that a game
+names, like parts/, or named by another SWF next to them, are taken for parts of
+that game.
 
 Only the Python standard library is needed.
 """
@@ -793,128 +800,147 @@ class Timeline:
                                 code_start, code_end))
 
 
+def not_swf_kind(data):
+    """What a file that isn't a SWF seems to be."""
+    head = data[:48]
+    if head.startswith(b"\x89PNG"):
+        return "PNG image"
+    if head.startswith(b"\xff\xd8"):
+        return "JPEG image"
+    if head.startswith(b"GIF8"):
+        return "GIF image"
+    if all(32 <= b < 127 or b in (9, 10, 13) for b in head):
+        return "text: " + head.decode("ascii").replace("\r", " ").replace("\n", " ")
+    return "unknown, starts with " + head[:8].hex(" ")
+
+
+class Movie:
+    """What a SWF file has and does, as far as this script reads it."""
+
+    def __init__(self, data):
+        self.size = len(data)
+        self.version, self.signature, body = decompress(data)
+        self.body = body
+        nbits = body[0] >> 3
+        rect_bytes = (5 + nbits * 4 + 7) // 8
+        bits = int.from_bytes(body[:rect_bytes], "big")
+        total_bits = rect_bytes * 8
+        coords = [(bits >> (total_bits - 5 - nbits * (i + 1))) & ((1 << nbits) - 1) for i in range(4)]
+        self.width, self.height = (coords[1] - coords[0]) // 20, (coords[3] - coords[2]) // 20
+        self.frame_rate = body[rect_bytes + 1] + body[rect_bytes] / 256
+        self.frame_count = struct.unpack_from("<H", body, rect_bytes + 2)[0]
+        pos = rect_bytes + 4
+
+        self.as3 = False
+        scenes, scene_labels, frame_labels, self.stop_frames = None, [], [], []
+        self.main, self.nested, self.blocks = Actions(), Actions(), []
+        main, nested, blocks = self.main, self.nested, self.blocks
+        timeline = Timeline(body, self.version, main, nested, blocks)
+        self.abc, self.abc_blocks, self.classes = [], [], []
+        # Embedded: (character ID, start, end) of SWFs in binary data
+        self.symbol_names, self.embedded = {}, []
+        self.sprites = []  # (ID, frame count, labels)
+        self.exports, self.imports = {}, []
+        self.tag_counts = {}
+        frame = 1
+        for code, start, end in read_tags(body, pos, len(body)):
+            self.tag_counts[code] = self.tag_counts.get(code, 0) + 1
+            if code == SHOW_FRAME:
+                frame += 1
+            elif code == FILE_ATTRIBUTES and start < end:
+                self.as3 = bool(body[start] & 0x08)
+            elif code == FRAME_LABEL:
+                frame_labels.append((frame, Reader(body, start).cstring()))
+            elif code == SCENE_AND_FRAME_LABELS:
+                reader = Reader(body, start)
+                scenes = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
+                scene_labels = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
+            elif code == DO_ACTION:
+                if timeline.frame_code(f"frame {frame}", start, end).stops:
+                    self.stop_frames.append(frame)
+            elif code == PLACE_OBJECT_2:
+                timeline.placed_code(f"frame {frame}", start, end)
+            elif code == DO_INIT_ACTION:
+                sprite_id = struct.unpack_from("<H", body, start)[0]
+                nested.scan(body, start + 2, end)
+                blocks.append((f"#initclip of clip #{sprite_id}", start + 2, end))
+            elif code in (DEFINE_BUTTON, DEFINE_BUTTON_2):
+                button_id = struct.unpack_from("<H", body, start)[0]
+                find = button_1_actions if code == DEFINE_BUTTON else button_2_actions
+                for block_start, block_end in find(body, start, end):
+                    nested.scan(body, block_start, block_end)
+                    blocks.append((f"button #{button_id}", block_start, block_end))
+            elif code == DEFINE_SPRITE:
+                sprite_id, sprite_frames = struct.unpack_from("<HH", body, start)
+                sprite = Timeline(body, self.version, nested, nested, blocks)
+                labels, sub_frame = [], 1
+                for sub_code, sub_start, sub_end in read_tags(body, start + 4, end):
+                    if sub_code == SHOW_FRAME:
+                        sub_frame += 1
+                    elif sub_code == FRAME_LABEL:
+                        labels.append((sub_frame, Reader(body, sub_start).cstring()))
+                    elif sub_code == DO_ACTION:
+                        sprite.frame_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
+                    elif sub_code == PLACE_OBJECT_2:
+                        sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
+                self.sprites.append((sprite_id, sprite_frames, labels))
+            elif code == EXPORT_ASSETS:
+                reader = Reader(body, start)
+                for _ in range(reader.u16()):
+                    character_id = reader.u16()
+                    self.exports[character_id] = reader.cstring()
+            elif code in (IMPORT_ASSETS, IMPORT_ASSETS_2):
+                reader = Reader(body, start)
+                url = reader.cstring()
+                if code == IMPORT_ASSETS_2:
+                    reader.u16()  # Reserved
+                names = []
+                for _ in range(reader.u16()):
+                    reader.u16()
+                    names.append(reader.cstring())
+                self.imports.append((url, names))
+            elif code in (DO_ABC, DO_ABC_DEFINE):
+                abc_start = start
+                if code == DO_ABC:
+                    abc_start = body.index(b"\0", start + 4) + 1  # Skip the flags and name
+                self.abc += abc_strings(body, abc_start, end)
+                self.abc_blocks.append(abc_start)
+            elif code == SYMBOL_CLASS:
+                reader = Reader(body, start)
+                for _ in range(reader.u16()):
+                    character_id = reader.u16()
+                    self.classes.append(reader.cstring())
+                    self.symbol_names[character_id] = self.classes[-1]
+            elif code == DEFINE_BINARY_DATA and end - start > 14:
+                if body[start + 6:start + 9] in (b"FWS", b"CWS", b"ZWS"):  # After the ID and 4 reserved bytes
+                    self.embedded.append((struct.unpack_from("<H", body, start)[0], start + 6, end))
+
+        # Like Flash, FrameLabel tags only count when there's no scene data.
+        self.labels = scene_labels if scenes is not None else frame_labels
+        self.scenes = scenes or []
+
+    def text(self):
+        """The readable strings in the file, where file names would appear."""
+        # Short names would turn up in binary data by chance, so only longer runs count.
+        return "\n".join(re.findall(r"[\x20-\x7e]{4,}", self.body.decode("latin-1")))
+
+
 def describe(path, display_name, other_names, dump, data=None):
     """Prints what the SWF file at `path`, or the SWF `data`, has and does."""
     if data is None:
         data = open(path, "rb").read()
     size = f"{len(data) / 1024:.0f} KB"
-    unpacked = decompress(data) if len(data) > 8 else None
-    if unpacked is None:
-        head = data[:48]
-        if head.startswith(b"\x89PNG"):
-            kind = "PNG image"
-        elif head.startswith(b"\xff\xd8"):
-            kind = "JPEG image"
-        elif head.startswith(b"GIF8"):
-            kind = "GIF image"
-        elif all(32 <= b < 127 or b in (9, 10, 13) for b in head):
-            kind = "text: " + head.decode("ascii").replace("\r", " ").replace("\n", " ")
-        else:
-            kind = "unknown, starts with " + head[:8].hex(" ")
-        print(f"== {display_name}  ({size}, not a SWF: {kind})")
+    if len(data) <= 8 or decompress(data) is None:
+        print(f"== {display_name}  ({size}, not a SWF: {not_swf_kind(data)})")
         return
+    m = Movie(data)
+    main, nested, body = m.main, m.nested, m.body
 
-    version, signature, body = unpacked
-    nbits = body[0] >> 3
-    rect_bytes = (5 + nbits * 4 + 7) // 8
-    bits = int.from_bytes(body[:rect_bytes], "big")
-    total_bits = rect_bytes * 8
-    coords = [(bits >> (total_bits - 5 - nbits * (i + 1))) & ((1 << nbits) - 1) for i in range(4)]
-    width, height = (coords[1] - coords[0]) // 20, (coords[3] - coords[2]) // 20
-    frame_rate = body[rect_bytes + 1] + body[rect_bytes] / 256
-    frame_count = struct.unpack_from("<H", body, rect_bytes + 2)[0]
-    pos = rect_bytes + 4
-
-    as3 = False
-    scenes, scene_labels, frame_labels, stop_frames = None, [], [], []
-    main, nested, blocks = Actions(), Actions(), []
-    timeline = Timeline(body, version, main, nested, blocks)
-    abc, abc_blocks, classes = [], [], []
-    symbol_names, embedded = {}, []  # Embedded: (character ID, start, end) of SWFs in binary data
-    sprites = []  # (ID, frame count, labels)
-    exports, imports = {}, []
-    tag_counts = {}
-    frame = 1
-    for code, start, end in read_tags(body, pos, len(body)):
-        tag_counts[code] = tag_counts.get(code, 0) + 1
-        if code == SHOW_FRAME:
-            frame += 1
-        elif code == FILE_ATTRIBUTES and start < end:
-            as3 = bool(body[start] & 0x08)
-        elif code == FRAME_LABEL:
-            frame_labels.append((frame, Reader(body, start).cstring()))
-        elif code == SCENE_AND_FRAME_LABELS:
-            reader = Reader(body, start)
-            scenes = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
-            scene_labels = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
-        elif code == DO_ACTION:
-            if timeline.frame_code(f"frame {frame}", start, end).stops:
-                stop_frames.append(frame)
-        elif code == PLACE_OBJECT_2:
-            timeline.placed_code(f"frame {frame}", start, end)
-        elif code == DO_INIT_ACTION:
-            sprite_id = struct.unpack_from("<H", body, start)[0]
-            nested.scan(body, start + 2, end)
-            blocks.append((f"#initclip of clip #{sprite_id}", start + 2, end))
-        elif code in (DEFINE_BUTTON, DEFINE_BUTTON_2):
-            button_id = struct.unpack_from("<H", body, start)[0]
-            find = button_1_actions if code == DEFINE_BUTTON else button_2_actions
-            for block_start, block_end in find(body, start, end):
-                nested.scan(body, block_start, block_end)
-                blocks.append((f"button #{button_id}", block_start, block_end))
-        elif code == DEFINE_SPRITE:
-            sprite_id, sprite_frames = struct.unpack_from("<HH", body, start)
-            sprite = Timeline(body, version, nested, nested, blocks)
-            labels, sub_frame = [], 1
-            for sub_code, sub_start, sub_end in read_tags(body, start + 4, end):
-                if sub_code == SHOW_FRAME:
-                    sub_frame += 1
-                elif sub_code == FRAME_LABEL:
-                    labels.append((sub_frame, Reader(body, sub_start).cstring()))
-                elif sub_code == DO_ACTION:
-                    sprite.frame_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
-                elif sub_code == PLACE_OBJECT_2:
-                    sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
-            sprites.append((sprite_id, sprite_frames, labels))
-        elif code == EXPORT_ASSETS:
-            reader = Reader(body, start)
-            for _ in range(reader.u16()):
-                character_id = reader.u16()
-                exports[character_id] = reader.cstring()
-        elif code in (IMPORT_ASSETS, IMPORT_ASSETS_2):
-            reader = Reader(body, start)
-            url = reader.cstring()
-            if code == IMPORT_ASSETS_2:
-                reader.u16()  # Reserved
-            names = []
-            for _ in range(reader.u16()):
-                reader.u16()
-                names.append(reader.cstring())
-            imports.append((url, names))
-        elif code in (DO_ABC, DO_ABC_DEFINE):
-            abc_start = start
-            if code == DO_ABC:
-                abc_start = body.index(b"\0", start + 4) + 1  # Skip the flags and name
-            abc += abc_strings(body, abc_start, end)
-            abc_blocks.append(abc_start)
-        elif code == SYMBOL_CLASS:
-            reader = Reader(body, start)
-            for _ in range(reader.u16()):
-                character_id = reader.u16()
-                classes.append(reader.cstring())
-                symbol_names[character_id] = classes[-1]
-        elif code == DEFINE_BINARY_DATA and end - start > 14:
-            if body[start + 6:start + 9] in (b"FWS", b"CWS", b"ZWS"):  # After the ID and 4 reserved bytes
-                embedded.append((struct.unpack_from("<H", body, start)[0], start + 6, end))
-
-    # Like Flash, FrameLabel tags only count when there's no scene data.
-    labels = scene_labels if scenes is not None else frame_labels
-    scenes = scenes or []
-    print(f"== {display_name}  ({size}, {signature} v{version}, {'AS3' if as3 else 'AS1/AS2'}, "
-          f"{width}x{height} @ {frame_rate:g} fps, {frame_count} frames, {len(sprites)} sprites)")
-    print("   scenes: " + (limited(scenes, lambda s: f"{s[0]}:{s[1]!r}") if scenes else "none"))
-    print(f"   labels ({len(labels)}): " + (format_labels(labels) or "none"))
-    print(f"   main timeline stops at frames ({len(stop_frames)}): " + (limited(stop_frames) or "none"))
+    print(f"== {display_name}  ({size}, {m.signature} v{m.version}, {'AS3' if m.as3 else 'AS1/AS2'}, "
+          f"{m.width}x{m.height} @ {m.frame_rate:g} fps, {m.frame_count} frames, {len(m.sprites)} sprites)")
+    print("   scenes: " + (limited(m.scenes, lambda s: f"{s[0]}:{s[1]!r}") if m.scenes else "none"))
+    print(f"   labels ({len(m.labels)}): " + (format_labels(m.labels) or "none"))
+    print(f"   main timeline stops at frames ({len(m.stop_frames)}): " + (limited(m.stop_frames) or "none"))
     for title, items in (
         ("main timeline goes to", main.gotos),
         ("main timeline calls", main.calls),
@@ -929,7 +955,7 @@ def describe(path, display_name, other_names, dump, data=None):
     functions = dedupe(main.functions)
     if functions:
         print(f"   main timeline functions ({len(functions)}): {limited(functions)}")
-    for url, names in imports:
+    for url, names in m.imports:
         print(f"   imports from {url!r} ({len(names)}): {limited(names, repr)}")
     file_like = [s for s in dedupe(main.strings + nested.strings)
                  if len(s) <= 120 and not re.search("[<>\"']", s) and FILE_LIKE.search(s)]
@@ -947,31 +973,30 @@ def describe(path, display_name, other_names, dump, data=None):
         if len(arrays) > MAX_CLIP_LABELS:
             print(f"      ... (+{len(arrays) - MAX_CLIP_LABELS} more)")
 
-    clips = sorted((s for s in sprites if s[2] or s[1] >= LONG_TIMELINE), key=lambda s: -s[1])
+    clips = sorted((s for s in m.sprites if s[2] or s[1] >= LONG_TIMELINE), key=lambda s: -s[1])
     if clips:
         print(f"   clips with labels or {LONG_TIMELINE}+ frames ({len(clips)}):")
         for sprite_id, sprite_frames, sprite_labels in clips[:MAX_ITEMS]:
-            name = f" {exports[sprite_id]!r}" if sprite_id in exports else ""
+            name = f" {m.exports[sprite_id]!r}" if sprite_id in m.exports else ""
             label_text = f", labels {format_labels(sprite_labels, MAX_CLIP_LABELS)}" if sprite_labels else ""
             print(f"      #{sprite_id}{name}: {sprite_frames} frames{label_text}")
         if len(clips) > MAX_ITEMS:
             print(f"      ... (+{len(clips) - MAX_ITEMS} more)")
-    if exports:
-        print(f"   exported symbols ({len(exports)}): {limited(exports.values(), repr)}")
+    if m.exports:
+        print(f"   exported symbols ({len(m.exports)}): {limited(m.exports.values(), repr)}")
 
-    if classes:
-        print(f"   AS3 classes ({len(classes)}): {limited(dedupe(classes), repr)}")
-    if abc:
+    if m.classes:
+        print(f"   AS3 classes ({len(m.classes)}): {limited(dedupe(m.classes), repr)}")
+    if m.abc:
         pattern = re.compile(r"(\.swf|Loader|URLRequest|load|goto|scene|/[\w.-])", re.I)
         file_names = {os.path.basename(name) for name in other_names}
         # Leave out qualified method names like "pkg:Class/pkg:method".
         method_name = re.compile(r"^[\w$.]*:[\w$]+/")
-        interesting = [s for s in dedupe(abc) if 0 < len(s) <= 100 and not method_name.match(s) and (
+        interesting = [s for s in dedupe(m.abc) if 0 < len(s) <= 100 and not method_name.match(s) and (
             pattern.search(s) or any(name in s for name in file_names if len(name) > 1))]
         print(f"   AS3 strings about loading/navigation ({len(interesting)}): {limited(interesting, repr)}")
 
-    # Only look in readable strings, as short names would turn up in binary data by chance.
-    text = "\n".join(re.findall(r"[\x20-\x7e]{4,}", body.decode("latin-1")))
+    text = m.text()
     mentioned = [name for name in other_names if name != display_name and
                  re.search(r"(?<![\w-])" + re.escape(os.path.basename(name)) + r"(?![\w-])", text)]
     if mentioned:
@@ -979,14 +1004,14 @@ def describe(path, display_name, other_names, dump, data=None):
 
     if dump:
         print("   tags: " + ", ".join(f"{TAG_NAMES.get(code, code)} x{count}"
-                                      for code, count in tag_counts.items()))
-        for abc_start in abc_blocks:
+                                      for code, count in m.tag_counts.items()))
+        for abc_start in m.abc_blocks:
             try:
                 for line in Abc(body, abc_start).outline():
                     print("   " + line)
             except (IndexError, ValueError, struct.error) as e:
                 print(f"   (couldn't read the AS3 classes: {type(e).__name__}: {e})")
-        for title, start, end in blocks:
+        for title, start, end in m.blocks:
             if dump == "main" and not title.startswith("frame "):
                 continue
             print(f"   -- {title} ({end - start} bytes)")
@@ -994,14 +1019,148 @@ def describe(path, display_name, other_names, dump, data=None):
                 print("      " + line)
 
     # Movies often embed others to load with Loader.loadBytes(), which are described too.
-    for character_id, start, end in embedded:
-        name = symbol_names.get(character_id, f"#{character_id}")
+    for character_id, start, end in m.embedded:
+        name = m.symbol_names.get(character_id, f"#{character_id}")
         describe(None, f"{display_name} > embedded {name}", other_names, dump, data=body[start:end])
+
+
+# The versions of the engine whose own scene lists Ruffle's scene menu reads, by a
+# variable that only that version has, newest first. All of them keep the list in
+# `Qvar` or `scenelist`, and switch scenes with a `setScreen` function.
+ENGINE_VERSIONS = [
+    ("Qfrm", "Mortal Combat's"),
+    ("Qvar", "NC2's"),
+    ("scenelist", "Olympic Contest's"),
+]
+SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE = (
+    "supported", "frame labels only", "unknown", "couldn't read")
+
+
+def scene_count(movie):
+    """How many scenes a game's own scene list has, if the code says."""
+    for name, values in movie.main.arrays:
+        if name in ("Qvar", "scenelist"):
+            return len(values)
+    # Some versions split a string of the scene names, which are exported symbols.
+    exported = set(movie.exports.values())
+    for string in movie.main.strings:
+        names = string.split(",")
+        if len(names) > 1 and all(name in exported for name in names):
+            return len(names)
+    return None
+
+
+def scene_method(movie):
+    """How a movie handles its scenes, as (status, description)."""
+    strings = set(movie.main.strings)
+    if "setScreen" in movie.main.functions and strings & {"Qvar", "scenelist"}:
+        version = next(version for variable, version in ENGINE_VERSIONS if variable in strings)
+        count = scene_count(movie)
+        details = f", {count} scenes" if count else ""
+        return SUPPORTED, f"its own scene list, in {version} version of its engine{details}"
+    if len(movie.scenes) > 1:
+        return SUPPORTED, f"{len(movie.scenes)} scenes on the main timeline"
+    if movie.labels:
+        return LABELS_ONLY, f"no scenes, {len(movie.labels)} frame labels on the main timeline"
+
+    hints = ["AS3" if movie.as3 else "AS1/AS2"]
+    all_strings = movie.main.strings + movie.nested.strings + movie.abc
+    if any(string in ("loadMovie", "loadMovieNum", "loadClip", "Loader", "URLRequest")
+           or string.lower().endswith(".swf") for string in all_strings):
+        hints.append("loads other files")
+    if movie.embedded:
+        hints.append(f"embeds {len(movie.embedded)} SWFs")
+    labelled = sum(1 for _, _, labels in movie.sprites if labels)
+    if labelled:
+        hints.append(f"{labelled} movie clips with frame labels")
+    return UNKNOWN, f"unknown method for handling scenes in this game ({'; '.join(hints)})"
+
+
+def classify(args):
+    """Prints how each game in the given folders handles its scenes, and a tally."""
+    by_folder = {}  # Folder -> (folder to show it relative to, SWFs in it)
+    for arg in args:
+        base = os.path.dirname(os.path.abspath(arg))
+        if os.path.isdir(arg):
+            for root, dirs, names in os.walk(arg):
+                dirs.sort()
+                swfs = [os.path.join(root, name) for name in sorted(names)
+                        if name.lower().endswith(".swf")]
+                if swfs:
+                    by_folder[os.path.abspath(root)] = (base, swfs)
+        else:
+            by_folder.setdefault(os.path.dirname(os.path.abspath(arg)), (base, []))[1].append(arg)
+
+    statuses, details, unknown, part_count = {}, {}, [], 0
+    linked_folders = {}  # Folder -> names of the folders its SWFs name, like "parts"
+    for folder, (base, folder_paths) in by_folder.items():
+        # SWFs in a subfolder that a SWF above it names, like "parts/", are its parts.
+        ancestors = [other for other in linked_folders if folder.startswith(other + os.sep)]
+        if ancestors:
+            nearest = max(ancestors, key=len)
+            subfolder = os.path.relpath(folder, nearest).split(os.sep)[0]
+            if subfolder.lower() in linked_folders[nearest]:
+                part_count += len(folder_paths)
+                linked_folders[folder] = linked_folders[nearest]
+                continue
+        movies = {}
+        for path in folder_paths:
+            try:
+                data = open(path, "rb").read()
+                movies[path] = Movie(data) if len(data) > 8 and decompress(data) else None
+            except Exception as e:  # Keep going, so one odd file doesn't hide the rest
+                movies[path] = e
+        texts = {path: movie.text() for path, movie in movies.items() if isinstance(movie, Movie)}
+        linked_folders[folder] = {name.lower() for text in texts.values()
+                                  for name in re.findall(r"([\w .-]+)[/\\]", text)}
+        # So are SWFs that another SWF next to them names, as it loads them.
+        names = {os.path.basename(path): path for path in folder_paths}
+        parts = set()
+        for path, text in texts.items():
+            if len(names) > 1:
+                parts |= {other for name, other in names.items() if other != path and
+                          re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", text)}
+        part_count += len(parts)
+
+        print(f"== {os.path.relpath(folder, base)}")
+        for path, movie in movies.items():
+            if path in parts:
+                continue
+            name = os.path.basename(path)
+            if isinstance(movie, Movie):
+                status, description = scene_method(movie)
+            elif movie is None:
+                status, description = UNREADABLE, "not a SWF"
+            else:
+                status, description = UNREADABLE, f"{type(movie).__name__}: {movie}"
+            statuses[status] = statuses.get(status, 0) + 1
+            if status == SUPPORTED:
+                version = re.search(r"in (.*) version", description)
+                key = version.group(1) if version else "scenes on the main timeline"
+                details[key] = details.get(key, 0) + 1
+            elif status == UNKNOWN:
+                shown = os.path.relpath(path, base).replace(os.sep, "/")
+                unknown.append(f"{shown} {description[description.index('('):]}")
+            print(f"   [{status}] {name}: {description}")
+
+    total = sum(statuses.values())
+    print(f"== {total} games: " + ", ".join(
+        f"{statuses.get(status, 0)} {status}" for status in (SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE)))
+    if details:
+        print("   supported, by kind: " + ", ".join(f"{key} {count}" for key, count in details.items()))
+    if unknown:
+        print("   unknown: " + "; ".join(unknown))
+    if part_count:
+        were = "SWF was" if part_count == 1 else "SWFs were"
+        print(f"   ({part_count} {were} taken for parts of these games and left out: those in "
+              f"a subfolder that a game names, like parts/, and those another SWF next to them names)")
+    return 0
 
 
 def main(args):
     dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
-    args = [arg for arg in args if arg not in ("--dump", "--dump-main")]
+    classifying = "--classify" in args
+    args = [arg for arg in args if arg not in ("--dump", "--dump-main", "--classify")]
     if not args:
         print(__doc__)
         return 1
@@ -1009,6 +1168,8 @@ def main(args):
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     except AttributeError:
         pass
+    if classifying:
+        return classify(args)
     files = []
     for arg in args:
         if os.path.isdir(arg):
