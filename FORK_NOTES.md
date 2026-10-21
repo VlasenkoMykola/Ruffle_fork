@@ -108,11 +108,12 @@ Other games:
   main one (`Main_s0_class`...`Main_s8_class`, from `s0.swf`...`s8.swf`), loaded by a `Main`
   class. Not supported yet; a `--dump` of it shows its classes and methods.
 
-User testing so far: Nice Christmas 2, Olympic Contest and Titans 2 switch scenes. Mortal
-Combat did nothing, most likely because that test used the build that set `Qscr`; the
-builds since Android `0aaa1fa` call `setScreen`, and since Android `6b41de4` (Windows
-`09eaca375`) they pass a number to the `Qfrm` version. Retests of Mortal Combat, Avatar and
-Hitomi were pending when these notes were written.
+User testing so far: Nice Christmas 2, Olympic Contest, Titans 2 and Mortal Combat switch
+scenes. Mortal Combat first did nothing, on the build that set `Qscr`; it works since
+Android `6b41de4` (Windows `09eaca375`), which call `setScreen` and pass a number to the
+`Qfrm` version. Avatar and Hitomi haven't been tested yet. On the user's collection,
+`--classify` finds most SWF games supported and many unknown; the user sends samples of the
+unknown ones first.
 
 ## Frontends
 
