@@ -27,6 +27,11 @@ const CURRENT_SCENE_NAME: &str = "screen_name";
 /// shown, in the versions of the engine that have one.
 const CURRENT_SCENE_NUMBERS: [&str; 2] = ["Qpos", "pos"];
 
+/// The variable of the root timeline that holds the number of scenes, in the version of
+/// the engine whose [`SHOW_SCENE`] takes the 1-based number of a scene. The versions
+/// without it take its name.
+const SCENE_COUNT: &str = "Qfrm";
+
 /// The most scenes read from a game's scene list.
 const MAX_GAME_SCENES: i32 = 1000;
 
@@ -175,7 +180,11 @@ impl GameScenes {
         let scene = Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
             let (list, length) = scene_list(object, activation)?;
             let index = i32::try_from(index).ok().filter(|index| *index < length)?;
-            Some(list.get_element(activation, index))
+            if matches!(stored(object, SCENE_COUNT, activation), Value::Number(_)) {
+                Some(Value::Number(f64::from(index) + 1.0))
+            } else {
+                Some(list.get_element(activation, index))
+            }
         });
         let Some(scene) = scene else {
             return;
@@ -371,13 +380,24 @@ mod tests {
         assert!(player.root_timeline().unwrap().game_scenes.is_none());
     }
 
+    /// How a test movie's `setScreen` picks the scene to show.
+    #[derive(Clone, Copy, Debug)]
+    enum ShowScene {
+        /// It takes the name of the scene.
+        ByName,
+        /// It takes the 1-based number of the scene, and the number of scenes is in `Qfrm`.
+        ByNumber,
+        /// There's no `setScreen`.
+        Missing,
+    }
+
     /// A movie that keeps its scene list like the games [`super::GameScenes`] is for, in
     /// the variable `list`, with the number of the scene being shown in `current` if
-    /// given. Without `shows_scenes`, it has no function to switch scenes with.
+    /// given.
     fn game_with_scene_list(
         list: &'static str,
         current: Option<&'static str>,
-        shows_scenes: bool,
+        show: ShowScene,
     ) -> Vec<u8> {
         use swf::avm1::types::{Action, DefineFunction, Push, Value};
 
@@ -396,12 +416,25 @@ mod tests {
         }
         let string = |string: &'static str| Value::Str(string.into());
 
-        // screen_name = name;
-        let show_scene = actions(&[
-            push(&[string("screen_name"), string("name")]),
-            Action::GetVariable,
-            Action::SetVariable,
-        ]);
+        let show_scene = match show {
+            // screen_name = name;
+            ShowScene::ByName => actions(&[
+                push(&[string("screen_name"), string("name")]),
+                Action::GetVariable,
+                Action::SetVariable,
+            ]),
+            // screen_name = <list>[name - 1];
+            _ => actions(&[
+                push(&[string("screen_name"), string(list)]),
+                Action::GetVariable,
+                push(&[string("name")]),
+                Action::GetVariable,
+                push(&[Value::Int(1)]),
+                Action::Subtract,
+                Action::GetMember,
+                Action::SetVariable,
+            ]),
+        };
         // var <list> = ["intro", "fight", "ending"]; var <current> = 1; var screen_name;
         // function setScreen(name) { ... }
         let mut setup = vec![
@@ -420,7 +453,10 @@ mod tests {
         if let Some(current) = current {
             setup.extend([push(&[string(current), Value::Int(1)]), Action::DefineLocal]);
         }
-        if shows_scenes {
+        if matches!(show, ShowScene::ByNumber) {
+            setup.extend([push(&[string("Qfrm"), Value::Int(3)]), Action::DefineLocal]);
+        }
+        if !matches!(show, ShowScene::Missing) {
             setup.push(Action::DefineFunction(DefineFunction {
                 name: "setScreen".into(),
                 params: vec!["name".into()],
@@ -442,12 +478,12 @@ mod tests {
 
     #[test]
     fn navigate_game_scenes() {
-        for (list, current) in [
-            ("scenelist", Some("pos")),
-            ("Qvar", Some("Qpos")),
-            ("Qvar", None),
+        for (list, current, show) in [
+            ("scenelist", Some("pos"), ShowScene::ByName),
+            ("Qvar", Some("Qpos"), ShowScene::ByName),
+            ("Qvar", None, ShowScene::ByNumber),
         ] {
-            let player = load_swf(&game_with_scene_list(list, current, true));
+            let player = load_swf(&game_with_scene_list(list, current, show));
             let mut player = player.lock().unwrap();
 
             let scenes = player
@@ -470,7 +506,11 @@ mod tests {
 
     #[test]
     fn ignore_scene_lists_of_other_movies() {
-        let player = load_swf(&game_with_scene_list("scenelist", Some("pos"), false));
+        let player = load_swf(&game_with_scene_list(
+            "scenelist",
+            Some("pos"),
+            ShowScene::Missing,
+        ));
         let mut player = player.lock().unwrap();
         assert!(player.root_timeline().unwrap().game_scenes.is_none());
     }

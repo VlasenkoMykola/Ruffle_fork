@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarizes how SWF files are structured and how they load each other.
 
-Usage: python swfinfo.py [--dump] <file or folder> [<file or folder> ...]
+Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folder> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
@@ -12,7 +12,8 @@ described after it. Folders are read recursively.
 
 With --dump, it also lists the tags of each file, outlines its AS3 classes with
 what their methods use, and prints all of its AS1/AS2 code, which gets long for
-big files.
+big files. --dump-main prints only the code of the main timeline, which is enough
+to see how many games move between their scenes.
 
 Only the Python standard library is needed.
 """
@@ -986,6 +987,8 @@ def describe(path, display_name, other_names, dump, data=None):
             except (IndexError, ValueError, struct.error) as e:
                 print(f"   (couldn't read the AS3 classes: {type(e).__name__}: {e})")
         for title, start, end in blocks:
+            if dump == "main" and not title.startswith("frame "):
+                continue
             print(f"   -- {title} ({end - start} bytes)")
             for line in disassemble(body, start, end):
                 print("      " + line)
@@ -997,8 +1000,8 @@ def describe(path, display_name, other_names, dump, data=None):
 
 
 def main(args):
-    dump = "--dump" in args
-    args = [arg for arg in args if arg != "--dump"]
+    dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
+    args = [arg for arg in args if arg not in ("--dump", "--dump-main")]
     if not args:
         print(__doc__)
         return 1
