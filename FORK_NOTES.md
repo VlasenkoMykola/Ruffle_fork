@@ -161,13 +161,12 @@ Other games:
   main one (`Main_s0_class`...`Main_s8_class`, from `s0.swf`...`s8.swf`), loaded by a `Main`
   class. Not supported yet; a `--dump` of it shows its classes and methods.
 
-User testing so far: Nice Christmas 2, Olympic Contest, Titans 2 and Mortal Combat switch
-scenes. Mortal Combat first did nothing, on the build that set `Qscr`; it works since
-Android `6b41de4` (Windows `09eaca375`), which call `setScreen` and pass a number to the
-`Qfrm` version. In Avatar the menu shows hashed names like `540e8d62` (the game's own: its
-scene 1 is a one-frame clip, its main menu), and most lead to a scene. In Hitomi many led
-to the main menu, as its `setScreen` is relative (see above); core gives it the
-difference since then, untested by the user so far. On the user's collection,
+User testing so far: scene switching works in Nice Christmas 2, Olympic Contest, Titans 2,
+Mortal Combat, Avatar, Hitomi, Big Queen 1 and 2, Evil Sorceress, Avatar The Last Airbender
+and Baka 1 (Android `030412c`, Windows `e665692b3`). Mortal Combat first did nothing, on the
+build that set `Qscr`, and many of Hitomi's choices led to the main menu until core gave
+its relative `setScreen` the difference. Avatar's and Hitomi's menus show the games' own
+hashed names, like `540e8d62`. On the user's collection,
 `--classify` finds 532 of 693 games supported, 10 with frame labels only and 151 unknown;
 the user sends samples of the unknown ones first.
 
