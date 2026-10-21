@@ -132,7 +132,13 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
   themselves (`loadMovie("parts/btmq0", this)`, and into `_level0` from `parts/esrm`), so
   the game's code is in the parts. Their arrays are like the `scenelist` version's, with
   other names: `screens` (and `fscommand("bct", 11)`), and `screens_list` with the part of
-  each scene in `screens_arr`.
+  each scene in `screens_arr`. Each part (SWF 15, AS2) has its own `setScreen` and
+  `gotoScreen`, exports the clips of its scenes (`screen_0`...`screen_3` in `btmq0`,
+  `screen_4`...`screen_7` in `btmq1`, `screen_8`...`screen_10` in `btmq2`; `screen_0`,
+  `screen_1`, `screen_5` in `esrm1`, `screen_2`...`screen_4` in `esrm2`, `screen_6`...
+  `screen_10` in `esrm3`, as `screens_arr` says), and loads the other parts over the root
+  in turn (`loadMovie("parts/btmq1", this)`; `esrm` ones into `_level0`). The `btmq` parts
+  use `_root.screens` and `_root.Qscr`, which the launcher set before it was replaced.
 - **Avatar The Last Airbender** and **Baka 1**: the version without a list (0 above), which
   the menu supports since it lists the exported scene clips.
 
