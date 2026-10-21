@@ -4,6 +4,7 @@
 Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folder> ...]
        python swfinfo.py --classify <folder> [<folder> ...]
        python swfinfo.py --unsupported <folder> [<folder> ...]
+       python swfinfo.py --unsupported-names <folder> [<folder> ...]
        python swfinfo.py --scenes <file> [<file> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
@@ -23,7 +24,8 @@ handles its scenes: in one of the ways Ruffle's scene menu supports, with frame
 labels only, or in a way it doesn't know yet. SWFs in a subfolder that a game
 names, like parts/, or named by another SWF next to them, are taken for parts of
 that game. --unsupported does the same, but leaves the supported games out of the
-list (they're still counted).
+list (they're still counted). --unsupported-names prints only the paths of the games
+that aren't supported, one per line, to run this script on one at a time.
 
 --scenes lists the scenes of games that keep their own list of them, with what the
 movie has under each name: the movie clip the game shows for it, its labels, and
@@ -1264,9 +1266,10 @@ def launcher_method(path, movie):
     return None
 
 
-def classify(args, unsupported_only=False):
+def classify(args, unsupported_only=False, names_only=False):
     """Prints how each game in the given folders handles its scenes, and a tally. With
-    `unsupported_only`, the supported games are left out of the list."""
+    `unsupported_only`, the supported games are left out of the list. With `names_only`,
+    it prints only the paths of the games that aren't supported."""
     by_folder = {}  # Folder -> (folder to show it relative to, SWFs in it)
     for arg in args:
         base = os.path.dirname(os.path.abspath(arg))
@@ -1332,12 +1335,17 @@ def classify(args, unsupported_only=False):
             elif status == UNKNOWN:
                 shown = os.path.relpath(path, base).replace(os.sep, "/")
                 unknown.append(f"{shown} {description[description.index('('):]}")
-            if not (unsupported_only and status == SUPPORTED):
+            if names_only:
+                if status != SUPPORTED:
+                    print(path)
+            elif not (unsupported_only and status == SUPPORTED):
                 lines.append(f"   [{status}] {name}: {description}")
         if lines:
             print(f"== {os.path.relpath(folder, base)}")
             print("\n".join(lines))
 
+    if names_only:
+        return 0
     total = sum(statuses.values())
     print(f"== {total} games: " + ", ".join(
         f"{statuses.get(status, 0)} {status}" for status in (SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE)))
@@ -1354,9 +1362,10 @@ def classify(args, unsupported_only=False):
 
 def main(args):
     dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
-    unsupported_only = "--unsupported" in args
+    names_only = "--unsupported-names" in args
+    unsupported_only = "--unsupported" in args or names_only
     classifying, scenes = "--classify" in args or unsupported_only, "--scenes" in args
-    modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--scenes")
+    modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes")
     args = [arg for arg in args if arg not in modes]
     expanded = []
     for arg in args:
@@ -1371,7 +1380,7 @@ def main(args):
     except AttributeError:
         pass
     if classifying:
-        return classify(args, unsupported_only)
+        return classify(args, unsupported_only, names_only)
     if scenes:
         for path in args:
             try:
