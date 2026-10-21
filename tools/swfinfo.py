@@ -327,6 +327,7 @@ class Actions:
         self.calls = []
         self.strings = []
         self.arrays = []  # (variable name, values) of array literals
+        self.functions = []  # Names of the functions defined
 
     def merge(self, other):
         self.stops |= other.stops
@@ -335,6 +336,7 @@ class Actions:
         self.calls += other.calls
         self.strings += other.strings
         self.arrays += other.arrays
+        self.functions += other.functions
 
     def scan(self, data, start, end):
         constants = []
@@ -364,6 +366,10 @@ class Actions:
                     if not looks_like_decoy(pool):
                         constants = pool
                         self.strings += constants
+                elif code in (0x9B, 0x8E):  # DefineFunction(2)
+                    name = body.cstring()
+                    if name:
+                        self.functions.append(name)
                 elif code == 0x96:  # Push
                     values = push_values(data, pos, pos + length, constants)
                     self.strings += [v for v in values if type(v) is str]
@@ -706,6 +712,9 @@ def describe(path, display_name, other_names, dump):
         items = dedupe(items)
         if items:
             print(f"   {title} ({len(items)}): {limited(items)}")
+    functions = dedupe(main.functions)
+    if functions:
+        print(f"   main timeline functions ({len(functions)}): {limited(functions)}")
     for url, names in imports:
         print(f"   imports from {url!r} ({len(names)}): {limited(names, repr)}")
     file_like = [s for s in dedupe(main.strings + nested.strings)
