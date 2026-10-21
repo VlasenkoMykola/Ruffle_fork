@@ -355,6 +355,10 @@ class Actions:
         self.strings = []
         self.arrays = []  # (variable name, values) of array literals
         self.functions = []  # Names of the functions defined
+        # Frame numbers the code jumps its own timeline to, and the root timeline to
+        # (with _root.gotoAndPlay(n), or inside tellTarget("_root")), as Ruffle's menu reads them
+        self.own_frame_jumps = []
+        self.root_frame_jumps = []
 
     def merge(self, other):
         self.stops |= other.stops
@@ -364,22 +368,33 @@ class Actions:
         self.strings += other.strings
         self.arrays += other.arrays
         self.functions += other.functions
+        self.own_frame_jumps += other.own_frame_jumps
+        self.root_frame_jumps += other.root_frame_jumps
 
     def scan(self, data, start, end):
         constants = []
         recent = []  # Values pushed lately, newest last
+        told = None  # The target of tellTarget: None for the code's own, "root" or "other"
+        jumps = {None: self.own_frame_jumps, "root": self.root_frame_jumps, "other": []}
         for _, code, pos, length in decode_actions(data, start, end):
             body = Reader(data, pos)
             try:
                 if code == 0x07:  # Stop
                     self.stops = True
                 elif code == 0x81:  # GotoFrame
-                    self.gotos.append(str(body.u16() + 1))
+                    frame = body.u16() + 1
+                    self.gotos.append(str(frame))
+                    jumps[told].append(frame)
                 elif code == 0x8C:  # GotoLabel
                     self.gotos.append(repr(body.cstring()))
                 elif code == 0x9F:  # GotoFrame2
                     target = recent[-1] if recent else "?"
                     self.gotos.append(str(target) if isinstance(target, int) else repr(target))
+                    if type(target) is int:
+                        jumps[told].append(target)
+                elif code == 0x8B:  # SetTarget
+                    target = body.cstring()
+                    told = None if not target else "root" if is_root_path(target) else "other"
                 elif code == 0x83:  # GetURL
                     url, target = body.cstring(), body.cstring()
                     self.strings.append(url)
@@ -409,6 +424,11 @@ class Actions:
                         self.arrays.append((name if type(name) is str else "?", values))
                         recent = recent[:-1 - count] + [Special("[array]")]
                 elif code in (0x52, 0x3D):  # CallMethod, CallFunction
+                    # _root.gotoAndPlay(n): n, 1, "_root" (got), "gotoAndPlay"
+                    if (code == 0x52 and len(recent) >= 4 and recent[-1] in ("gotoAndPlay", "gotoAndStop")
+                            and type(recent[-2]) is str and is_root_path(recent[-2])
+                            and recent[-3] == 1 and type(recent[-4]) is int):
+                        self.root_frame_jumps.append(recent[-4])
                     if recent and type(recent[-1]) is str:
                         name = recent[-1]
                         args = [repr(v) for v in recent[-8:-1] if type(v) is str][-3:]
@@ -422,6 +442,10 @@ class Actions:
                     recent = []
             except (IndexError, ValueError, struct.error):
                 pass
+
+
+def is_root_path(path):
+    return path.lower() in ("_root", "_level0", "/", "_root/", "_level0/")
 
 
 def disassemble(data, start, end):
@@ -877,6 +901,9 @@ class Movie:
         self.sprites = []  # (ID, frame count, labels)
         # Strings in the code of each clip and button, and the characters placed in each clip
         self.own_strings, self.children = {}, {}
+        # The characters placed on the main timeline, and the frames each button's code
+        # jumps its timeline to
+        self.root_children, self.button_jumps = set(), {}
         self.exports, self.imports = {}, []
         self.tag_counts = {}
         frame = 1
@@ -890,13 +917,24 @@ class Movie:
                 frame_labels.append((frame, Reader(body, start).cstring()))
             elif code == SCENE_AND_FRAME_LABELS:
                 reader = Reader(body, start)
-                scenes = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
-                scene_labels = [(reader.u30() + 1, reader.cstring()) for _ in range(reader.u30())]
+                scenes = []
+                try:  # Counts can claim more than the tag holds; what fits is kept
+                    for _ in range(reader.u30()):
+                        scenes.append((reader.u30() + 1, reader.cstring()))
+                    for _ in range(reader.u30()):
+                        scene_labels.append((reader.u30() + 1, reader.cstring()))
+                except (IndexError, ValueError):
+                    pass
             elif code == DO_ACTION:
                 if timeline.frame_code(f"frame {frame}", start, end).stops:
                     self.stop_frames.append(frame)
             elif code == PLACE_OBJECT_2:
                 timeline.placed_code(f"frame {frame}", start, end)
+            if code in (PLACE_OBJECT, PLACE_OBJECT_2, PLACE_OBJECT_3):
+                try:
+                    self.root_children.add(placed_character(code, body, start))
+                except (IndexError, struct.error):
+                    pass
             elif code == DO_INIT_ACTION:
                 sprite_id = struct.unpack_from("<H", body, start)[0]
                 init = Actions()
@@ -912,6 +950,7 @@ class Movie:
                     button.scan(body, block_start, block_end)
                     nested.merge(button)
                     self.own_strings.setdefault(button_id, []).extend(button.strings)
+                    self.button_jumps.setdefault(button_id, []).extend(button.own_frame_jumps)
                     blocks.append((f"button #{button_id}", block_start, block_end))
             elif code == DEFINE_SPRITE:
                 sprite_id, sprite_frames = struct.unpack_from("<HH", body, start)
@@ -1089,8 +1128,9 @@ ENGINE_VERSIONS = [
 # The lists of scenes that launchers which load their parts over themselves keep in
 # _global, with the parts' setScreen switching scenes, by the version of the engine.
 LAUNCHER_LISTS = {"screens": "Big Queen 1's", "screens_list": "Evil Sorceress's"}
-SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE = (
-    "supported", "frame labels only", "unknown", "couldn't read")
+SUPPORTED, LABELS_ONLY, JUMPS_ONLY, UNKNOWN, UNREADABLE = (
+    "supported", "frame labels only", "only frame jumps supported", "unknown", "couldn't read")
+STATUSES = (SUPPORTED, LABELS_ONLY, JUMPS_ONLY, UNKNOWN, UNREADABLE)
 
 
 def game_scene_list(movie):
@@ -1149,6 +1189,16 @@ def scene_count(movie):
     return len(scene_list[1]) if scene_list else None
 
 
+def frame_jumps(movie):
+    """The frames after the first that a movie's code jumps its main timeline to, which
+    Ruffle's menu lists for games with no other way to navigate: from the code of the main
+    timeline and of the buttons placed on it, and _root.gotoAndPlay(n) anywhere."""
+    jumps = movie.main.own_frame_jumps + movie.main.root_frame_jumps + movie.nested.root_frame_jumps
+    for character in movie.root_children:
+        jumps += movie.button_jumps.get(character, [])
+    return sorted({frame for frame in jumps if 1 < frame <= movie.frame_count})
+
+
 def scene_method(movie):
     """How a movie handles its scenes, as (status, description)."""
     strings = set(movie.main.strings)
@@ -1165,6 +1215,10 @@ def scene_method(movie):
         return SUPPORTED, f"{len(movie.scenes)} scenes on the main timeline"
     if movie.labels:
         return LABELS_ONLY, f"no scenes, {len(movie.labels)} frame labels on the main timeline"
+    jumps = frame_jumps(movie)
+    if jumps:
+        return JUMPS_ONLY, (f"no scenes or frame labels; the menu lists frame 1 and the {len(jumps)} "
+                            f"frames its code jumps the main timeline to")
 
     hints = ["AS3" if movie.as3 else "AS1/AS2"]
     all_strings = movie.main.strings + movie.nested.strings + movie.abc
@@ -1191,6 +1245,8 @@ def describe_scenes(path):
     if status == UNKNOWN:
         status, description = launcher_method(path, m) or (status, description)
     print(f"== {name}: [{status}] {description}")
+    if status == JUMPS_ONLY:
+        print("   frames its code jumps the main timeline to: " + limited(frame_jumps(m)))
     scene_list = game_scene_list(m)
     if scene_list:
         where, names = scene_list
@@ -1351,8 +1407,7 @@ def classify(args, unsupported_only=False, names_only=False):
     if names_only:
         return 0
     total = sum(statuses.values())
-    print(f"== {total} games: " + ", ".join(
-        f"{statuses.get(status, 0)} {status}" for status in (SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE)))
+    print(f"== {total} games: " + ", ".join(f"{statuses.get(status, 0)} {status}" for status in STATUSES))
     if details:
         print("   supported, by kind: " + ", ".join(f"{key} {count}" for key, count in details.items()))
     if unknown and not unsupported_only:  # With unsupported_only, the list above has them

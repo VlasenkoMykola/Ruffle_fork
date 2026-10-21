@@ -50,6 +50,17 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
 - `Player::goto_and_play_root_frame(frame)` jumps the root timeline (1-based).
 - `GameScenes { names, current }`, with `previous()` and `next()`, is the scene list of games
   that keep their own (see below), and `Player::goto_game_scene(index)` switches to one.
+- Frame jumps: for movies with no game scene list, scene clips, scenes or frame labels,
+  `Player::root_timeline()` makes the frames that the movie's own code jumps its root
+  timeline to into `scenes`, named "Frame N" (from frame 1, each up to the next), and sets
+  `scenes_are_frame_jumps`, so the frontends' scene menus list them with no changes of
+  their own. `frame_jumps` in `root_timeline.rs` reads them from the tags: `gotoAndPlay(n)`
+  and `gotoAndStop(n)` (GotoFrame, or GotoFrame2 after a pushed number) in the code of the
+  root timeline (functions included) and of the buttons placed on it, and
+  `_root.gotoAndPlay(n)`, `_level0...` or `tellTarget("_root")` in any code. For old games
+  that keep their parts on one long timeline, like Tsunade's Debt (1524 frames, 36 jumps
+  on the main timeline, no labels). Reading all of Ruffle's 4931 test SWFs this way takes
+  3.4 s in all.
 - Tests: `cargo test -p ruffle_core --lib root_timeline`. They build their game movies with
   the `swf` crate, in the variable layouts below, and with exported clips for the version
   without a list.
@@ -201,7 +212,10 @@ output they paste back, since the games themselves aren't shared:
   method uses), and a disassembly of all AS1/AS2 code. `--dump-main`: only the main
   timeline's code, for big games.
 - `--classify <folders>`: one line per game on how it handles scenes (supported, frame
-  labels only, unknown, unreadable), and a tally. SWFs in a subfolder that a game names
+  labels only, only frame jumps supported, unknown, unreadable), and a tally. "Only frame
+  jumps supported" is for games the menu can only offer the frame jumps above for, as
+  read by the script's `frame_jumps` the same way, which the user doesn't count as
+  supported; `--scenes` lists their frames. SWFs in a subfolder that a game names
   (like `parts/`), or named by another SWF next to them, count as its parts.
 - `--unsupported <folders>`: the same, listing only the games that aren't supported (the
   tally still counts all of them), to find the next samples. `--unsupported-names

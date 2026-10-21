@@ -880,6 +880,7 @@ impl Player {
             let root = context.stage.root_clip()?;
             let mut timeline = RootTimeline::from_movie_clip(root.as_movie_clip()?);
             timeline.game_scenes = GameScenes::read(context, root);
+            timeline.add_frame_jumps(&root.movie());
             Some(timeline)
         })
     }

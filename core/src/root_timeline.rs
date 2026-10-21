@@ -9,6 +9,10 @@ use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, MovieClip, TDisplayObject, TDisplayObjectContainer};
 use crate::prelude::CharacterId;
 use crate::string::{AvmString, WStr};
+use crate::tag_utils::SwfMovieData;
+use std::collections::HashSet;
+use swf::avm1::types::{Action, Value as Avm1Value};
+use swf::{SwfStr, Tag, TagCode};
 
 /// The variables in which games made with a certain engine keep their own list of
 /// scenes, in each version of the engine. Like the other variables of the engine, they're
@@ -106,7 +110,16 @@ pub struct RootTimeline {
     /// `DefineSceneAndFrameLabelData` tag, which Flash writes for AS3 movies.
     /// Flash merges the scenes of AS1/AS2 movies into one timeline, so for
     /// those this is usually empty and `labels` is the best way to navigate.
+    ///
+    /// For movies with no other way to navigate, these are the frames that the
+    /// movie's own code jumps its root timeline to, named "Frame N": see
+    /// `scenes_are_frame_jumps`.
     pub scenes: Vec<TimelineScene>,
+
+    /// Whether `scenes` are the frames the movie's own code jumps the root timeline
+    /// to, as it has no scenes, frame labels or scene list of its own, like old games
+    /// that keep each of their parts on frames of one long timeline.
+    pub scenes_are_frame_jumps: bool,
 
     /// Frame labels sorted by frame number.
     pub labels: Vec<TimelineLabel>,
@@ -358,6 +371,197 @@ fn scene_clips<'gc>(
         .collect()
 }
 
+/// The 1-based frames that the code in the tag stream `data` of a movie jumps its root
+/// timeline to: `gotoAndPlay(n)` and `gotoAndStop(n)` in the code of the root timeline
+/// and of the buttons placed on it, and `_root.gotoAndPlay(n)` (or `_level0`, or inside
+/// `tellTarget("_root")`) anywhere. Unreadable code is skipped.
+fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
+    let mut jumps = Vec::new();
+    let mut buttons = Vec::new();
+    let mut placed_on_root = HashSet::new();
+    // Code whose own target is a movie clip, which only jumps the root explicitly.
+    let mut clip_code = Vec::new();
+    fn add_clip_actions<'a>(place_object: &swf::PlaceObject<'a>, code: &mut Vec<&'a [u8]>) {
+        for clip_action in place_object
+            .clip_actions
+            .iter()
+            .flat_map(|actions| &actions.records)
+        {
+            code.push(clip_action.action_data);
+        }
+    }
+
+    let mut reader = swf::read::Reader::new(data, version);
+    while let Ok((tag_code, length)) = reader.read_tag_code_and_length() {
+        let rest = reader.get_ref();
+        let Some(body) = rest.get(..length) else {
+            break;
+        };
+        *reader.get_mut() = &rest[length..];
+        let mut tag = swf::read::Reader::new(body, version);
+        match TagCode::from_u16(tag_code) {
+            Some(TagCode::End) => break,
+            Some(TagCode::DoAction) => scan_jumps(body, version, true, &mut jumps),
+            Some(TagCode::DoInitAction) => clip_code.extend(body.get(2..)),
+            Some(TagCode::DefineButton) => buttons.extend(tag.read_define_button_1().ok()),
+            Some(TagCode::DefineButton2) => buttons.extend(tag.read_define_button_2().ok()),
+            Some(code @ (TagCode::PlaceObject | TagCode::PlaceObject2 | TagCode::PlaceObject3)) => {
+                let place_object = match code {
+                    TagCode::PlaceObject => tag.read_place_object(),
+                    TagCode::PlaceObject2 => tag.read_place_object_2_or_3(2),
+                    _ => tag.read_place_object_2_or_3(3),
+                };
+                if let Ok(place_object) = place_object {
+                    if let swf::PlaceObjectAction::Place(id) | swf::PlaceObjectAction::Replace(id) =
+                        place_object.action
+                    {
+                        placed_on_root.insert(id);
+                    }
+                    add_clip_actions(&place_object, &mut clip_code);
+                }
+            }
+            Some(TagCode::DefineSprite) => {
+                for sprite_tag in tag
+                    .read_define_sprite()
+                    .map(|sprite| sprite.tags)
+                    .unwrap_or_default()
+                {
+                    match sprite_tag {
+                        Tag::DoAction(code) => clip_code.push(code),
+                        Tag::PlaceObject(place_object) => {
+                            add_clip_actions(&place_object, &mut clip_code)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for button in &buttons {
+        let on_root = placed_on_root.contains(&button.id);
+        for action in &button.actions {
+            scan_jumps(action.action_data, version, on_root, &mut jumps);
+        }
+    }
+    for code in clip_code {
+        scan_jumps(code, version, false, &mut jumps);
+    }
+    jumps
+}
+
+/// Adds the frames that the AVM1 `code` jumps the root timeline to to `jumps`, where
+/// `on_root` is whether the code's own target is the root timeline.
+fn scan_jumps(code: &[u8], version: u8, on_root: bool, jumps: &mut Vec<u16>) {
+    /// A value on the stack, as far as it's followed.
+    enum Item<'a> {
+        Number(f64),
+        String(&'a SwfStr),
+        Variable(&'a SwfStr),
+        Other,
+    }
+    let is_root = |path: &SwfStr| {
+        ["_root", "_level0", "/", "_root/", "_level0/"]
+            .iter()
+            .any(|root| path.as_bytes().eq_ignore_ascii_case(root.as_bytes()))
+    };
+    let add = |jumps: &mut Vec<u16>, frame: f64| {
+        if frame.fract() == 0.0 && (1.0..=f64::from(u16::MAX)).contains(&frame) {
+            jumps.push(frame as u16);
+        }
+    };
+
+    let mut reader = swf::avm1::read::Reader::new(code, version);
+    let mut constants: Vec<&SwfStr> = Vec::new();
+    let mut stack = Vec::new();
+    let mut target_is_root = on_root;
+    while let Ok(action) = reader.read_action() {
+        match action {
+            Action::End => break,
+            Action::ConstantPool(pool) => constants = pool.strings,
+            Action::Push(push) => stack.extend(push.values.iter().map(|value| {
+                match value {
+                    Avm1Value::Int(number) => Item::Number(f64::from(*number)),
+                    Avm1Value::Float(number) => Item::Number(f64::from(*number)),
+                    Avm1Value::Double(number) => Item::Number(*number),
+                    Avm1Value::Str(string) => Item::String(string),
+                    Avm1Value::ConstantPool(index) => constants
+                        .get(usize::from(*index))
+                        .map_or(Item::Other, |string| Item::String(string)),
+                    _ => Item::Other,
+                }
+            })),
+            Action::GetVariable => {
+                let variable = match stack.pop() {
+                    Some(Item::String(name)) => Item::Variable(name),
+                    _ => Item::Other,
+                };
+                stack.push(variable);
+            }
+            Action::GotoFrame(goto) if target_is_root => add(jumps, f64::from(goto.frame) + 1.0),
+            Action::GotoFrame2(goto) => {
+                if let (true, Some(Item::Number(frame))) = (target_is_root, stack.pop()) {
+                    add(jumps, frame + f64::from(goto.scene_offset));
+                }
+                stack.clear();
+            }
+            Action::SetTarget(set_target) => {
+                target_is_root = if set_target.target.is_empty() {
+                    on_root
+                } else {
+                    is_root(set_target.target)
+                };
+            }
+            Action::CallMethod => {
+                let name = stack.pop();
+                let object = stack.pop();
+                let count = stack.pop();
+                let frame = stack.pop();
+                if let (
+                    Some(Item::String(name)),
+                    Some(Item::Variable(object)),
+                    Some(Item::Number(count)),
+                    Some(Item::Number(frame)),
+                ) = (name, object, count, frame)
+                    && is_root(object)
+                    && count == 1.0
+                    && [b"gotoAndPlay".as_slice(), b"gotoAndStop"].contains(&name.as_bytes())
+                {
+                    add(jumps, frame);
+                }
+                stack.clear();
+            }
+            Action::DefineFunction(function) => {
+                scan_jumps(function.actions, version, on_root, jumps);
+                stack.clear();
+            }
+            Action::DefineFunction2(function) => {
+                scan_jumps(function.actions, version, on_root, jumps);
+                stack.clear();
+            }
+            Action::With(with) => {
+                scan_jumps(with.actions, version, target_is_root, jumps);
+                stack.clear();
+            }
+            Action::Try(try_block) => {
+                for body in [
+                    Some(try_block.try_body),
+                    try_block.catch_body.map(|(_, body)| body),
+                ]
+                .into_iter()
+                .chain([try_block.finally_body])
+                .flatten()
+                {
+                    scan_jumps(body, version, target_is_root, jumps);
+                }
+                stack.clear();
+            }
+            _ => stack.clear(),
+        }
+    }
+}
+
 impl RootTimeline {
     pub(crate) fn from_movie_clip(mc: MovieClip<'_>) -> Self {
         let total_frames = mc.header_frames();
@@ -384,12 +588,45 @@ impl RootTimeline {
 
         Self {
             scenes,
+            scenes_are_frame_jumps: false,
             labels,
             current_frame: mc.current_frame(),
             total_frames,
             frames_loaded,
             game_scenes: None,
         }
+    }
+
+    /// Makes the frames that the code of `movie`, the root timeline's, jumps the root
+    /// timeline to into its `scenes`, starting with the first frame, if it has no other
+    /// way to navigate. Call it after `game_scenes` is read.
+    pub(crate) fn add_frame_jumps(&mut self, movie: &SwfMovieData) {
+        if self.game_scenes.is_some() || self.scenes.len() > 1 || !self.labels.is_empty() {
+            return;
+        }
+        let mut frames = frame_jumps(movie.data(), movie.version());
+        frames.retain(|frame| (1..=self.total_frames).contains(frame));
+        frames.push(1);
+        frames.sort_unstable();
+        frames.dedup();
+        if frames.len() < 2 {
+            return;
+        }
+        self.scenes = frames
+            .iter()
+            .enumerate()
+            .map(|(index, &start)| {
+                let end = frames
+                    .get(index + 1)
+                    .map_or(self.total_frames, |next| next - 1);
+                TimelineScene {
+                    name: format!("Frame {start}"),
+                    start,
+                    length: end - start + 1,
+                }
+            })
+            .collect();
+        self.scenes_are_frame_jumps = true;
     }
 
     /// The index into `scenes` of the scene containing the playhead.
@@ -768,6 +1005,134 @@ mod tests {
             scenes.names,
             ["screen_1", "screen_2", "screen_10", "screen_failed"]
         );
+    }
+
+    /// A movie of old games' kind: one timeline of 8 frames, with no scenes or labels,
+    /// whose code jumps its root timeline to frames 2, 4, 5 and 6 in the ways
+    /// [`super::frame_jumps`] reads, and its movie clip to frame 7.
+    fn timeline_game() -> Vec<u8> {
+        use swf::{
+            Button, ButtonAction, ButtonActionCondition, PlaceObject, PlaceObjectAction, Sprite,
+            Tag,
+        };
+
+        // function next() { gotoAndPlay(2); } stop();
+        let next = actions(&[Action::GotoFrame(swf::avm1::types::GotoFrame { frame: 1 })]);
+        let mut root_code = actions(&[
+            Action::DefineFunction(DefineFunction {
+                name: "next".into(),
+                params: vec![],
+                actions: &next,
+            }),
+            Action::Stop,
+        ]);
+        root_code.push(0);
+        // on (release) { gotoAndStop(4); }
+        let mut button_code =
+            actions(&[Action::GotoFrame(swf::avm1::types::GotoFrame { frame: 3 })]);
+        button_code.push(0);
+        // function jump() {
+        //     _root.gotoAndPlay(5); tellTarget("_root") { gotoAndPlay(6); } gotoAndStop(7);
+        // }
+        let jump = actions(&[
+            push(&[Value::Int(5), Value::Int(1), string("_root")]),
+            Action::GetVariable,
+            push(&[string("gotoAndPlay")]),
+            Action::CallMethod,
+            Action::Pop,
+            Action::SetTarget(swf::avm1::types::SetTarget {
+                target: "_root".into(),
+            }),
+            Action::GotoFrame(swf::avm1::types::GotoFrame { frame: 5 }),
+            Action::SetTarget(swf::avm1::types::SetTarget { target: "".into() }),
+            Action::GotoFrame(swf::avm1::types::GotoFrame { frame: 6 }),
+        ]);
+        let mut clip_code = actions(&[Action::DefineFunction(DefineFunction {
+            name: "jump".into(),
+            params: vec![],
+            actions: &jump,
+        })]);
+        clip_code.push(0);
+
+        let place = |id, depth| {
+            Tag::PlaceObject(Box::new(PlaceObject {
+                version: 2,
+                action: PlaceObjectAction::Place(id),
+                depth,
+                matrix: None,
+                color_transform: None,
+                ratio: None,
+                name: None,
+                clip_depth: None,
+                class_name: None,
+                filters: None,
+                background_color: None,
+                blend_mode: None,
+                clip_actions: None,
+                has_image: false,
+                is_bitmap_cached: None,
+                is_visible: None,
+                amf_data: None,
+            }))
+        };
+        let mut tags = vec![
+            Tag::DefineSprite(Sprite {
+                id: 1,
+                num_frames: 1,
+                tags: vec![Tag::DoAction(&clip_code), Tag::ShowFrame],
+            }),
+            Tag::DefineButton2(Box::new(Button {
+                id: 2,
+                is_track_as_menu: false,
+                records: vec![],
+                actions: vec![ButtonAction {
+                    conditions: ButtonActionCondition::OVER_DOWN_TO_OVER_UP,
+                    action_data: &button_code,
+                }],
+            })),
+            place(1, 1),
+            place(2, 2),
+            Tag::DoAction(&root_code),
+        ];
+        tags.extend((0..8).map(|_| Tag::ShowFrame));
+        let header = swf::Header {
+            num_frames: 8,
+            ..swf::Header::default_with_swf_version(8)
+        };
+        let mut data = Vec::new();
+        swf::write_swf(&header, &tags, &mut data).unwrap();
+        data
+    }
+
+    #[test]
+    fn navigate_frame_jumps() {
+        let player = load_swf(&timeline_game());
+        let mut player = player.lock().unwrap();
+
+        let timeline = player.root_timeline().expect("root should be a movie clip");
+        assert!(timeline.scenes_are_frame_jumps);
+        assert!(timeline.game_scenes.is_none());
+        let scenes: Vec<_> = timeline
+            .scenes
+            .iter()
+            .map(|scene| (scene.name.as_str(), scene.start, scene.end()))
+            .collect();
+        assert_eq!(
+            scenes,
+            [
+                ("Frame 1", 1, 1),
+                ("Frame 2", 2, 3),
+                ("Frame 4", 4, 4),
+                ("Frame 5", 5, 5),
+                ("Frame 6", 6, 8),
+            ]
+        );
+        assert_eq!(timeline.current_scene(), Some(0));
+
+        let next = timeline.next_scene().expect("Frame 2 follows Frame 1");
+        player.goto_and_play_root_frame(next.start);
+        let timeline = player.root_timeline().unwrap();
+        assert_eq!(timeline.current_scene(), Some(1));
     }
 
     #[test]
