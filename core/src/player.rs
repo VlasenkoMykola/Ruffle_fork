@@ -889,7 +889,8 @@ impl Player {
     pub fn goto_game_scene(&mut self, index: usize) {
         self.mutate_with_update_context(|context| {
             if let Some(root) = context.stage.root_clip() {
-                GameScenes::request(context, root, index);
+                GameScenes::show(context, root, index);
+                Self::run_actions(context);
             }
         });
     }

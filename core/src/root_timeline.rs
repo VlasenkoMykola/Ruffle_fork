@@ -3,22 +3,29 @@
 //! Frontends use this to offer scene and frame label navigation, letting the
 //! user jump anywhere on the root timeline without playing through the movie.
 
-use crate::avm1::{Avm1, Value};
+use crate::avm1::{Activation, Avm1, Object as Avm1Object, Value};
 use crate::context::UpdateContext;
 use crate::display_object::{DisplayObject, MovieClip, TDisplayObject};
 use crate::string::AvmString;
 
-/// The variable of the root timeline that holds the 1-based number of the scene a game
-/// should switch to, in games that keep their own list of scenes.
+/// The variables of the root timeline in which games made with a certain engine keep
+/// their own list of scenes, in each version of the engine.
 ///
-/// Some games keep their scenes this way, in a launcher movie that loads the
-/// scenes from other files, so the root timeline has none of its own. They switch
-/// scenes with keys like Page Up and Page Down by setting this variable.
-const REQUESTED_SCENE: &str = "Qscr";
+/// Those games are a launcher movie that loads its scenes from other files, or keep
+/// each scene in a movie clip, so the root timeline has no scenes of its own. They
+/// switch scenes by calling the [`SHOW_SCENE`] function of the root timeline with a
+/// name from the list.
+const SCENE_LISTS: [&str; 2] = ["Qvar", "scenelist"];
 
-/// The variables of the root timeline that hold the list of scenes and the 1-based
-/// number of the scene being shown, in each version of the engine of those games.
-const SCENE_VARIABLES: [(&str, &str); 2] = [("Qvar", "Qpos"), ("scenelist", "pos")];
+/// The function of the root timeline that switches to the scene with the given name.
+const SHOW_SCENE: &str = "setScreen";
+
+/// The variable of the root timeline that holds the name of the scene being shown.
+const CURRENT_SCENE_NAME: &str = "screen_name";
+
+/// The variables of the root timeline that hold the 1-based number of the scene being
+/// shown, in the versions of the engine that have one.
+const CURRENT_SCENE_NUMBERS: [&str; 2] = ["Qpos", "pos"];
 
 /// The most scenes read from a game's scene list.
 const MAX_GAME_SCENES: i32 = 1000;
@@ -88,8 +95,8 @@ pub struct RootTimeline {
     pub game_scenes: Option<GameScenes>,
 }
 
-/// The scenes of a game that keeps its own list of them in variables of its
-/// root timeline, which [`crate::Player::goto_game_scene`] switches between.
+/// The scenes of a game that keeps its own list of them in a variable of its root
+/// timeline, which [`crate::Player::goto_game_scene`] switches between.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GameScenes {
@@ -108,38 +115,38 @@ impl GameScenes {
     ) -> Option<Self> {
         let object = root.object1()?;
         Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
-            // The games declare this variable up front, which other movies are unlikely to.
-            let requested = AvmString::new_utf8(activation.gc(), REQUESTED_SCENE);
-            if !object.has_own_property(activation, requested) {
+            let show_scene = stored(object, SHOW_SCENE, activation);
+            if !matches!(show_scene, Value::Object(show_scene) if show_scene.as_function().is_some())
+            {
                 return None;
             }
 
-            SCENE_VARIABLES
-                .iter()
-                .find_map(|(list_name, current_name)| {
-                    let name = AvmString::new_utf8(activation.gc(), *list_name);
-                    let Ok(Value::Object(list)) = object.get_stored(name, activation) else {
-                        return None;
-                    };
-                    let length = list.length(activation).ok().filter(|length| *length > 0)?;
-                    let names: Vec<_> = (0..length.min(MAX_GAME_SCENES))
-                        .map(|index| match list.get_element(activation, index) {
-                            Value::String(name) => name.to_string(),
-                            _ => String::new(),
-                        })
-                        .collect();
+            let (list, length) = scene_list(object, activation)?;
+            let names: Vec<_> = (0..length)
+                .map(|index| match list.get_element(activation, index) {
+                    Value::String(name) => name.to_string(),
+                    _ => String::new(),
+                })
+                .collect();
 
-                    let name = AvmString::new_utf8(activation.gc(), *current_name);
-                    let current = match object.get_stored(name, activation) {
-                        Ok(Value::Number(number))
-                            if number >= 1.0 && number <= names.len() as f64 =>
-                        {
+            let current = match stored(object, CURRENT_SCENE_NAME, activation) {
+                Value::String(name) => {
+                    let name = name.to_string();
+                    names.iter().position(|scene| *scene == name)
+                }
+                _ => None,
+            }
+            .or_else(|| {
+                CURRENT_SCENE_NUMBERS.iter().find_map(|variable| {
+                    match stored(object, variable, activation) {
+                        Value::Number(number) if number >= 1.0 && number <= names.len() as f64 => {
                             Some(number as usize - 1)
                         }
                         _ => None,
-                    };
-                    Some(Self { names, current })
+                    }
                 })
+            });
+            Some(Self { names, current })
         })
     }
 
@@ -155,9 +162,9 @@ impl GameScenes {
         (next < self.names.len()).then_some(next)
     }
 
-    /// Asks the game whose root timeline is `root` to switch to the scene at `index`
-    /// in its scene list, which it does when it next checks.
-    pub(crate) fn request<'gc>(
+    /// Makes the game whose root timeline is `root` switch to the scene at `index` in
+    /// its scene list, the way the game's own controls do.
+    pub(crate) fn show<'gc>(
         context: &mut UpdateContext<'gc>,
         root: DisplayObject<'gc>,
         index: usize,
@@ -165,13 +172,50 @@ impl GameScenes {
         let Some(object) = root.object1() else {
             return;
         };
-        Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
-            let name = AvmString::new_utf8(activation.gc(), REQUESTED_SCENE);
-            if let Err(e) = object.set(name, Value::Number(index as f64 + 1.0), activation) {
-                tracing::warn!("Couldn't request game scene {index}: {e}");
-            }
+        let scene = Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
+            let (list, length) = scene_list(object, activation)?;
+            let index = i32::try_from(index).ok().filter(|index| *index < length)?;
+            Some(list.get_element(activation, index))
         });
+        let Some(scene) = scene else {
+            return;
+        };
+
+        // The games' own controls stop the sounds of the scene they leave, and show the
+        // mouse cursor, which some scenes hide.
+        context.stop_all_sounds();
+        context.ui.set_mouse_visible(true);
+        let show_scene = AvmString::new_utf8(context.gc(), SHOW_SCENE);
+        Avm1::run_stack_frame_for_method(root, object, show_scene, &[scene], context);
     }
+}
+
+/// The value stored in the variable `name` of `object`, without running any code.
+fn stored<'gc>(
+    object: Avm1Object<'gc>,
+    name: &str,
+    activation: &mut Activation<'_, 'gc>,
+) -> Value<'gc> {
+    let name = AvmString::new_utf8(activation.gc(), name);
+    object
+        .get_stored(name, activation)
+        .unwrap_or(Value::Undefined)
+}
+
+/// The game's list of scenes in the root timeline `object`, and how many of them to read.
+fn scene_list<'gc>(
+    object: Avm1Object<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+) -> Option<(Avm1Object<'gc>, i32)> {
+    SCENE_LISTS
+        .iter()
+        .find_map(|name| match stored(object, name, activation) {
+            Value::Object(list) => {
+                let length = list.length(activation).ok().filter(|length| *length > 0)?;
+                Some((list, length.min(MAX_GAME_SCENES)))
+            }
+            _ => None,
+        })
 }
 
 impl RootTimeline {
@@ -328,22 +372,21 @@ mod tests {
     }
 
     /// A movie that keeps its scene list like the games [`super::GameScenes`] is for, in
-    /// the variables `list` and `current`, and shows the scene requested in `Qscr` on its
-    /// second frame. Without `declares_request`, it doesn't declare `Qscr` up front.
+    /// the variable `list`, with the number of the scene being shown in `current` if
+    /// given. Without `shows_scenes`, it has no function to switch scenes with.
     fn game_with_scene_list(
         list: &'static str,
-        current: &'static str,
-        declares_request: bool,
+        current: Option<&'static str>,
+        shows_scenes: bool,
     ) -> Vec<u8> {
-        use swf::avm1::types::{Action, Push, Value};
+        use swf::avm1::types::{Action, DefineFunction, Push, Value};
 
-        fn code(actions: &[Action<'_>]) -> Vec<u8> {
+        fn actions(actions: &[Action<'_>]) -> Vec<u8> {
             let mut code = Vec::new();
             let mut writer = swf::avm1::write::Writer::new(&mut code, 8);
             for action in actions {
                 writer.write_action(action).unwrap();
             }
-            code.push(0); // End
             code
         }
         fn push(values: &[Value<'static>]) -> Action<'static> {
@@ -353,7 +396,14 @@ mod tests {
         }
         let string = |string: &'static str| Value::Str(string.into());
 
-        // var <list> = ["intro", "fight", "ending"]; var <current> = 1; var Qscr;
+        // screen_name = name;
+        let show_scene = actions(&[
+            push(&[string("screen_name"), string("name")]),
+            Action::GetVariable,
+            Action::SetVariable,
+        ]);
+        // var <list> = ["intro", "fight", "ending"]; var <current> = 1; var screen_name;
+        // function setScreen(name) { ... }
         let mut setup = vec![
             push(&[
                 string(list),
@@ -364,31 +414,27 @@ mod tests {
             ]),
             Action::InitArray,
             Action::DefineLocal,
-            push(&[string(current), Value::Int(1)]),
-            Action::DefineLocal,
+            push(&[string("screen_name")]),
+            Action::DefineLocal2,
         ];
-        if declares_request {
-            setup.extend([push(&[string("Qscr")]), Action::DefineLocal2]);
+        if let Some(current) = current {
+            setup.extend([push(&[string(current), Value::Int(1)]), Action::DefineLocal]);
         }
-        let setup = code(&setup);
-        // <current> = Qscr; stop();
-        let show_requested = code(&[
-            push(&[string(current), string("Qscr")]),
-            Action::GetVariable,
-            Action::SetVariable,
-            Action::Stop,
-        ]);
+        if shows_scenes {
+            setup.push(Action::DefineFunction(DefineFunction {
+                name: "setScreen".into(),
+                params: vec!["name".into()],
+                actions: &show_scene,
+            }));
+        }
+        let mut setup = actions(&setup);
+        setup.push(0); // End
 
         let header = swf::Header {
-            num_frames: 2,
+            num_frames: 1,
             ..swf::Header::default_with_swf_version(8)
         };
-        let tags = [
-            swf::Tag::DoAction(&setup),
-            swf::Tag::ShowFrame,
-            swf::Tag::DoAction(&show_requested),
-            swf::Tag::ShowFrame,
-        ];
+        let tags = [swf::Tag::DoAction(&setup), swf::Tag::ShowFrame];
         let mut data = Vec::new();
         swf::write_swf(&header, &tags, &mut data).unwrap();
         data
@@ -396,7 +442,11 @@ mod tests {
 
     #[test]
     fn navigate_game_scenes() {
-        for (list, current) in [("scenelist", "pos"), ("Qvar", "Qpos")] {
+        for (list, current) in [
+            ("scenelist", Some("pos")),
+            ("Qvar", Some("Qpos")),
+            ("Qvar", None),
+        ] {
             let player = load_swf(&game_with_scene_list(list, current, true));
             let mut player = player.lock().unwrap();
 
@@ -405,14 +455,14 @@ mod tests {
                 .and_then(|timeline| timeline.game_scenes)
                 .unwrap_or_else(|| panic!("the movie should have a scene list in {list}"));
             assert_eq!(scenes.names, ["intro", "fight", "ending"]);
-            assert_eq!(scenes.current, Some(0));
+            let first = current.map(|_| 0);
+            assert_eq!(scenes.current, first, "{list}, {current:?}");
             assert_eq!(scenes.previous(), None);
-            assert_eq!(scenes.next(), Some(1));
+            assert_eq!(scenes.next(), Some(first.map_or(0, |first| first + 1)));
 
             player.goto_game_scene(2);
-            player.run_frame();
             let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
-            assert_eq!(scenes.current, Some(2));
+            assert_eq!(scenes.current, Some(2), "{list}, {current:?}");
             assert_eq!(scenes.previous(), Some(1));
             assert_eq!(scenes.next(), None);
         }
@@ -420,7 +470,7 @@ mod tests {
 
     #[test]
     fn ignore_scene_lists_of_other_movies() {
-        let player = load_swf(&game_with_scene_list("scenelist", "pos", false));
+        let player = load_swf(&game_with_scene_list("scenelist", Some("pos"), false));
         let mut player = player.lock().unwrap();
         assert!(player.root_timeline().unwrap().game_scenes.is_none());
     }
