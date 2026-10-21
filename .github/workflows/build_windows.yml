@@ -1,7 +1,8 @@
 name: Build Windows
 
 # Builds the desktop app for Windows on every push to the fork's default branch,
-# and uploads it as a workflow artifact to download from the run's page.
+# uploads it as a workflow artifact, and publishes it as the "latest-windows-build"
+# pre-release, which can be downloaded at a fixed address without a GitHub login.
 
 on:
   push:
@@ -16,6 +17,8 @@ jobs:
   build:
     name: Windows x86_64
     runs-on: windows-2025
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v7
@@ -45,3 +48,21 @@ jobs:
         with:
           name: ruffle-windows-x86_64
           path: package/
+
+      - name: Zip
+        run: Compress-Archive -Path package/* -DestinationPath ruffle-windows-x86_64.zip
+
+      - name: Publish release
+        if: github.ref_name == 'claude/relaxed-gauss-ymscnb'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          subject=$(git log -1 --format=%s)
+          gh release delete latest-windows-build --cleanup-tag --yes || true
+          gh release create latest-windows-build ruffle-windows-x86_64.zip \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest Windows build" \
+            --notes "Built from commit $GITHUB_SHA (\"$subject\") by [this run]($RUN_URL). Unzip it and run ruffle.exe."
