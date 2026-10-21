@@ -28,9 +28,13 @@ movie has under each name: the movie clip the game shows for it, its labels, and
 what its code uses. The code of the main timeline follows, where the game sets up
 the list and switches between its scenes.
 
+Names with * or ? in them are expanded, as the Windows command line doesn't, so
+python swfinfo.py "parts/mq*" describes every file whose name starts with mq.
+
 Only the Python standard library is needed.
 """
 
+import glob
 import lzma
 import os
 import re
@@ -1274,6 +1278,11 @@ def main(args):
     dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
     classifying, scenes = "--classify" in args, "--scenes" in args
     args = [arg for arg in args if arg not in ("--dump", "--dump-main", "--classify", "--scenes")]
+    expanded = []
+    for arg in args:
+        matches = sorted(glob.glob(arg)) if "*" in arg or "?" in arg else []
+        expanded += matches or [arg]
+    args = expanded
     if not args:
         print(__doc__)
         return 1

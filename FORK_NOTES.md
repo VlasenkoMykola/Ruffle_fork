@@ -102,6 +102,22 @@ What's known about each, from `tools/swfinfo.py` dumps:
    next feature is listing the labels of the scene being shown (`game.screen`) to jump
    between them.
 
+Unknown to `--classify`, but of the same developer (samples sent so far):
+
+- **Big Queen 2**: a launcher of the `Qvar` version (12 scenes, `socket`, `parts/mq2`), whose
+  `Qvar` array is set by code in a clip, which `--classify` doesn't look at. Whether the menu
+  finds it depends on where that code puts it.
+- **Big Queen 1** and **Evil Sorceress**: launchers that load their first part over
+  themselves (`loadMovie("parts/btmq0", this)`, and into `_level0` from `parts/esrm`), so
+  the game's code is in the parts. Their arrays are like the `scenelist` version's, with
+  other names: `screens` (and `fscommand("bct", 11)`), and `screens_list` with the part of
+  each scene in `screens_arr`.
+- **Avatar The Last Airbender** and **Baka 1**: one SWF each, with `setScreen` and
+  `gotoScreen`, scenes exported as `mainmenu`, `screen1`... (and `screen_end` or
+  `screen_failed`), but no list variable; Baka sends `fscommand("mnf", 10)`. Probably an
+  older version, which the menu could serve from the exported names if `setScreen` takes
+  them. Baka's `parts/red.bar` is its progress bar.
+
 Other games:
 
 - **Digital Adventure** (another developer, AS3): its scenes look like SWFs embedded in the
@@ -114,8 +130,8 @@ Android `6b41de4` (Windows `09eaca375`), which call `setScreen` and pass a numbe
 `Qfrm` version. In Avatar the menu shows hashed names like `540e8d62`, and most lead to a
 scene; in Hitomi many lead to the main menu instead. `--scenes` was written to find out
 why (see below). On the user's collection,
-`--classify` finds most SWF games supported and many unknown; the user sends samples of the
-unknown ones first.
+`--classify` finds 532 of 693 games supported, 10 with frame labels only and 151 unknown;
+the user sends samples of the unknown ones first.
 
 ## Frontends
 
@@ -142,6 +158,7 @@ output they paste back, since the games themselves aren't shared:
 - `--classify <folders>`: one line per game on how it handles scenes (supported, frame
   labels only, unknown, unreadable), and a tally. SWFs in a subfolder that a game names
   (like `parts/`), or named by another SWF next to them, count as its parts.
+- Names with `*` or `?` are expanded by the script, since the Windows command line doesn't.
 - `--scenes <files>`: for games with their own scene list, each entry with the clip the
   movie exports under that name (frames, labels, which engine functions and variables its
   code and the code inside it use), or that it has none; then the main timeline's code.
