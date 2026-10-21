@@ -259,6 +259,14 @@ def decode_actions(data, start, end):
     return [(offset, *records[offset]) for offset in sorted(records)]
 
 
+def looks_like_decoy(constants):
+    """Whether a constant pool is mostly garbled, like the decoys that protectors put
+    in code that never runs, which would otherwise replace the real names."""
+    garbled = sum(1 for c in constants
+                  if "\ufffd" in c or any(ord(ch) < 32 and ch not in "\t\n\r" for ch in c))
+    return garbled * 2 > len(constants)
+
+
 class Special(str):
     """A pushed value that isn't a string, like a register or null."""
 
@@ -318,6 +326,7 @@ class Actions:
         self.loads = []
         self.calls = []
         self.strings = []
+        self.arrays = []  # (variable name, values) of array literals
 
     def merge(self, other):
         self.stops |= other.stops
@@ -325,6 +334,7 @@ class Actions:
         self.loads += other.loads
         self.calls += other.calls
         self.strings += other.strings
+        self.arrays += other.arrays
 
     def scan(self, data, start, end):
         constants = []
@@ -350,16 +360,25 @@ class Actions:
                     self.loads.append(f"getURL2/loadMovie({', '.join(args)})")
                     recent = []
                 elif code == 0x88:  # ConstantPool
-                    constants = [body.cstring() for _ in range(body.u16())]
-                    self.strings += constants
+                    pool = [body.cstring() for _ in range(body.u16())]
+                    if not looks_like_decoy(pool):
+                        constants = pool
+                        self.strings += constants
                 elif code == 0x96:  # Push
                     values = push_values(data, pos, pos + length, constants)
                     self.strings += [v for v in values if type(v) is str]
-                    recent = (recent + values)[-8:]
+                    recent = (recent + values)[-64:]
+                elif code == 0x42:  # InitArray
+                    count = recent[-1] if recent else None
+                    if type(count) is int and 0 < count < len(recent):
+                        values = recent[-1 - count:-1][::-1]
+                        name = recent[-2 - count] if count + 2 <= len(recent) else None
+                        self.arrays.append((name if type(name) is str else "?", values))
+                        recent = recent[:-1 - count] + [Special("[array]")]
                 elif code in (0x52, 0x3D):  # CallMethod, CallFunction
                     if recent and type(recent[-1]) is str:
                         name = recent[-1]
-                        args = [repr(v) for v in recent[:-1] if type(v) is str][-3:]
+                        args = [repr(v) for v in recent[-8:-1] if type(v) is str][-3:]
                         call = f"{name}({', '.join(args)})"
                         if name in LOAD_CALLS:
                             self.loads.append(call)
@@ -381,8 +400,12 @@ def disassemble(data, start, end):
         args = ""
         try:
             if code == 0x88:
-                constants = [body.cstring() for _ in range(body.u16())]
-                args = " ".join(f"c{i}={c!r}" for i, c in enumerate(constants))
+                pool = [body.cstring() for _ in range(body.u16())]
+                args = " ".join(f"c{i}={c!r}" for i, c in enumerate(pool))
+                if looks_like_decoy(pool):
+                    args += " (garbled, so taken for a decoy and ignored)"
+                else:
+                    constants = pool
             elif code == 0x96:
                 args = ", ".join(repr(v) for v in push_values(data, pos, pos + length, constants))
             elif code == 0x81:
@@ -689,6 +712,17 @@ def describe(path, display_name, other_names, dump):
                  if len(s) <= 120 and not re.search("[<>\"']", s) and FILE_LIKE.search(s)]
     if file_like:
         print(f"   file names in code ({len(file_like)}): {limited(file_like, repr)}")
+    fscommands = dedupe(s[len("fscommand:"):] for s in main.strings + nested.strings
+                        if s.lower().startswith("fscommand:"))
+    if fscommands:
+        print(f"   fscommands in code ({len(fscommands)}): {limited(fscommands, repr)}")
+    arrays = [a for a in main.arrays + nested.arrays if len(a[1]) >= 3]
+    if arrays:
+        print(f"   arrays in code ({len(arrays)}):")
+        for name, values in arrays[:MAX_CLIP_LABELS]:
+            print(f"      {name} ({len(values)}): {limited(values, repr, 20)}")
+        if len(arrays) > MAX_CLIP_LABELS:
+            print(f"      ... (+{len(arrays) - MAX_CLIP_LABELS} more)")
 
     clips = sorted((s for s in sprites if s[2] or s[1] >= LONG_TIMELINE), key=lambda s: -s[1])
     if clips:
