@@ -1120,8 +1120,9 @@ def game_scene_list(movie):
 
 def scene_clips(movie):
     """The export names of the movie clips of the scenes of a game whose version of the engine
-    has no scene list, in the order Ruffle's menu lists them: the main menu, screen1, screen2...,
-    then the others starting with screen_. There are none unless numbered ones are there."""
+    has no scene list, in the order Ruffle's menu lists them: the main menu, screen1, screen2...
+    (or screen_1, screen_2...), then the others starting with screen_. There are none unless
+    numbered ones are there."""
     sprites = {sprite_id for sprite_id, _, _ in movie.sprites}
     clips = []
     for character, name in movie.exports.items():
@@ -1130,8 +1131,8 @@ def scene_clips(movie):
             continue
         if lower == "mainmenu":
             order = (0, 0)
-        elif re.fullmatch(r"screen\d+", lower):
-            order = (1, int(lower[len("screen"):]))
+        elif re.fullmatch(r"screen_?\d+", lower):  # screen1, or screen_1 as in Universal Soldier
+            order = (1, int(lower[len("screen"):].lstrip("_")))
         elif lower.startswith("screen_"):
             order = (2, 0)
         else:

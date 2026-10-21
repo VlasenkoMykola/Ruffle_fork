@@ -51,7 +51,8 @@ const MAX_GAME_SCENES: i32 = 1000;
 const MAIN_MENU_CLIP: &str = "mainmenu";
 
 /// The start of the export names of the movie clips of scenes, in the version of the
-/// engine that has no scene list: `screen1`, `screen2`..., and others like `screen_end`.
+/// engine that has no scene list: `screen1`, `screen2`... (or `screen_1`, `screen_2`...),
+/// and others like `screen_end`.
 const SCENE_CLIP_PREFIX: &str = "screen";
 
 /// The instance name of the movie clip showing the scene, in the version of the engine
@@ -316,8 +317,9 @@ impl<'gc> SceneList<'gc> {
 
 /// The export names and IDs of the movie clips that the root timeline `root` exports for
 /// its scenes, in the version of the engine that has no scene list: the main menu, then
-/// `screen1`, `screen2`..., then the others whose names start with `screen_`. There are
-/// none unless numbered ones are there.
+/// `screen1`, `screen2`... (or `screen_1`, `screen_2`... in some games, like Universal
+/// Soldier), then the others whose names start with `screen_`. There are none unless
+/// numbered ones are there.
 fn scene_clips<'gc>(
     root: DisplayObject<'gc>,
     context: &UpdateContext<'gc>,
@@ -335,8 +337,10 @@ fn scene_clips<'gc>(
                 (0, 0)
             } else {
                 let rest = lower.strip_prefix(SCENE_CLIP_PREFIX)?;
-                match rest.parse::<u32>() {
-                    Ok(number) if rest.bytes().all(|byte| byte.is_ascii_digit()) => (1, number),
+                // `screen1` or `screen_1`
+                let digits = rest.strip_prefix('_').unwrap_or(rest);
+                match digits.parse::<u32>() {
+                    Ok(number) if digits.bytes().all(|byte| byte.is_ascii_digit()) => (1, number),
                     _ if rest.starts_with('_') => (2, 0),
                     _ => return None,
                 }
@@ -745,6 +749,25 @@ mod tests {
         let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
         assert_eq!(scenes.current, Some(3));
         assert_eq!(scenes.next(), Some(4));
+
+        // Universal Soldier's names, without a main menu
+        let player = load_swf(&game_with_scene_clips(&[
+            "screen_failed",
+            "screen_10",
+            "screen_1",
+            "trans_screen",
+            "screen_2",
+            "mainmenu_bg",
+        ]));
+        let mut player = player.lock().unwrap();
+        let scenes = player
+            .root_timeline()
+            .and_then(|timeline| timeline.game_scenes)
+            .expect("the movie's scenes should be its exported clips");
+        assert_eq!(
+            scenes.names,
+            ["screen_1", "screen_2", "screen_10", "screen_failed"]
+        );
     }
 
     #[test]

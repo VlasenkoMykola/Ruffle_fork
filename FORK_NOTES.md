@@ -59,8 +59,8 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
 A movie counts as such a game when its root timeline has a `setScreen` function and an
 array in `Qvar`, `scenelist`, `screens` or `screens_list` (each looked up on the root, then
 in `_global`, like the other variables below), or, without those, exports movie clips named `screen1`,
-`screen2`... (the list is then `mainmenu`, the numbered ones in order, and the other
-`screen_*` ones, like `screen_end`). The scene being shown is the one named in
+`screen2`... or `screen_1`, `screen_2`... (the list is then `mainmenu`, the numbered ones in
+order, and the other `screen_*` ones, like `screen_end`). The scene being shown is the one named in
 `screen_name`, or else numbered (1-based) in `Qpos`, `pos`, `Qmod` or `gn`, or else, for exported
 clips, the one the root's child `screen` is an instance of. To switch, core does what the
 games' own controls do: stop all sounds, show the mouse cursor, and call the root's
@@ -77,8 +77,11 @@ frame.)
 Most of the games tested are made by one developer, with one engine in several versions.
 What's known about each, from `tools/swfinfo.py` dumps:
 
-0. **Version without a list** (Avatar The Last Airbender, Baka 1). One SWF, whose scenes are
-   movie clips exported as `mainmenu`, `screen1`... (plus `screen_end` or `screen_failed`).
+0. **Version without a list** (Avatar The Last Airbender, Baka 1, Wheel of Wonder, Universal
+   Soldier, Tripping the Rift Six Satisfaction). One SWF, whose scenes are movie clips
+   exported as `mainmenu`, `screen1`... (plus `screen_end` or `screen_failed`), or as
+   `screen_0`, `screen_1`... in Universal Soldier (whose `Qscr` n is `"screen_" + (n - 1)`)
+   and Tripping the Rift (which starts at `setScreen("screen_5")`).
    `setScreen(clip_name)` removes `screen` and attaches the clip as `screen` on the root;
    `gotoScreen(clip_name)` plays `trans_screen` first. Baka also sets `screen_name`, sends
    `fscommand("bar", n + 1)` for `screenN` (1 for the main menu) and `fscommand("mnf", 10)`,
