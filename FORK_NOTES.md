@@ -137,8 +137,11 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
   `screen_4`...`screen_7` in `btmq1`, `screen_8`...`screen_10` in `btmq2`; `screen_0`,
   `screen_1`, `screen_5` in `esrm1`, `screen_2`...`screen_4` in `esrm2`, `screen_6`...
   `screen_10` in `esrm3`, as `screens_arr` says), and loads the other parts over the root
-  in turn (`loadMovie("parts/btmq1", this)`; `esrm` ones into `_level0`). The `btmq` parts
-  use `_root.screens` and `_root.Qscr`, which the launcher set before it was replaced.
+  in turn (`loadMovie("parts/btmq1", this)`; `esrm` ones into `_level0`). The launchers keep
+  their variables in `_global`, so they survive the parts replacing the root: Big Queen 1
+  sets `_global.screens` and `_global.Qpos = 1`; Evil Sorceress sets `_global.gn = 1`,
+  `_global.screens_list`, `_global.screens_arr` and `_global.qfile = "parts/esrm"`, then
+  loads `qfile + "1"` into `_level0`. Core only reads the root's variables so far.
 - **Avatar The Last Airbender** and **Baka 1**: the version without a list (0 above), which
   the menu supports since it lists the exported scene clips.
 
