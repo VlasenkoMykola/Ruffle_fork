@@ -1075,6 +1075,7 @@ def describe(path, display_name, other_names, dump, data=None):
 # variable that only that version has, newest first. All of them keep the list in
 # `Qvar` or `scenelist`, and switch scenes with a `setScreen` function.
 ENGINE_VERSIONS = [
+    ("Qmod", "Hitomi's"),
     ("Qfrm", "Mortal Combat's"),
     ("Qvar", "NC2's"),
     ("scenelist", "Olympic Contest's"),
@@ -1102,7 +1103,34 @@ def game_scene_list(movie):
             best, best_count = names, count
     if best:
         return "a string of names separated by commas, in the code of the main timeline", best
+    clips = scene_clips(movie)
+    if clips and "setScreen" in movie.main.functions:
+        return "the movie clips it exports for its scenes, as it has no list", clips
     return None
+
+
+def scene_clips(movie):
+    """The export names of the movie clips of the scenes of a game whose version of the engine
+    has no scene list, in the order Ruffle's menu lists them: the main menu, screen1, screen2...,
+    then the others starting with screen_. There are none unless numbered ones are there."""
+    sprites = {sprite_id for sprite_id, _, _ in movie.sprites}
+    clips = []
+    for character, name in movie.exports.items():
+        lower = name.lower()
+        if character not in sprites:
+            continue
+        if lower == "mainmenu":
+            order = (0, 0)
+        elif re.fullmatch(r"screen\d+", lower):
+            order = (1, int(lower[len("screen"):]))
+        elif lower.startswith("screen_"):
+            order = (2, 0)
+        else:
+            continue
+        clips.append((order, lower, name))
+    if not any(order[0] == 1 for order, _, _ in clips):
+        return []
+    return [name for _, _, name in sorted(clips)]
 
 
 def scene_count(movie):
@@ -1114,13 +1142,15 @@ def scene_count(movie):
 def scene_method(movie):
     """How a movie handles its scenes, as (status, description)."""
     strings = set(movie.main.strings)
-    # Some games set the list from the code of a clip, like Big Queen 2, which the menu finds too.
-    strings |= {name for name, _ in movie.nested.arrays if name in ("Qvar", "scenelist")}
     if "setScreen" in movie.main.functions and strings & {"Qvar", "scenelist"}:
         version = next(version for variable, version in ENGINE_VERSIONS if variable in strings)
         count = scene_count(movie)
         details = f", {count} scenes" if count else ""
         return SUPPORTED, f"its own scene list, in {version} version of its engine{details}"
+    clips = scene_clips(movie)
+    if "setScreen" in movie.main.functions and clips:
+        return SUPPORTED, (f"its own scene clips, in Avatar The Last Airbender's version of its "
+                           f"engine, {len(clips)} scenes")
     if len(movie.scenes) > 1:
         return SUPPORTED, f"{len(movie.scenes)} scenes on the main timeline"
     if movie.labels:
@@ -1152,11 +1182,11 @@ def describe_scenes(path):
     if scene_list:
         where, names = scene_list
         print(f"   the list ({len(names)} scenes) is {where}")
-        if "Qfrm" not in m.main.strings:
-            print("   its scenes are in the parts it loads, so this file can't tell more about them: "
-                  + limited(names, repr))
-            names = []
         by_export = {export.lower(): character for character, export in m.exports.items()}
+        if not any(str(scene).lower() in by_export for scene in names):
+            print("   none of them are movie clips of this file, so they're probably in the parts "
+                  "it loads: " + limited(names, repr))
+            names = []
         sprites = {sprite_id: (frames, labels) for sprite_id, frames, labels in m.sprites}
         # Names that tell how a scene's code works with the main timeline: its functions,
         # and the engine's variables.

@@ -4,17 +4,19 @@
 //! user jump anywhere on the root timeline without playing through the movie.
 
 use crate::avm1::{Activation, Avm1, Object as Avm1Object, Value};
+use crate::character::Character;
 use crate::context::UpdateContext;
-use crate::display_object::{DisplayObject, MovieClip, TDisplayObject};
-use crate::string::AvmString;
+use crate::display_object::{DisplayObject, MovieClip, TDisplayObject, TDisplayObjectContainer};
+use crate::prelude::CharacterId;
+use crate::string::{AvmString, WStr};
 
 /// The variables of the root timeline in which games made with a certain engine keep
 /// their own list of scenes, in each version of the engine.
 ///
 /// Those games are a launcher movie that loads its scenes from other files, or keep
 /// each scene in a movie clip, so the root timeline has no scenes of its own. They
-/// switch scenes by calling the [`SHOW_SCENE`] function of the root timeline with a
-/// name from the list.
+/// switch scenes by calling the [`SHOW_SCENE`] function of the root timeline with the
+/// name of a scene from the list, or its number in the versions that count them.
 const SCENE_LISTS: [&str; 2] = ["Qvar", "scenelist"];
 
 /// The function of the root timeline that switches to the scene with the given name.
@@ -25,7 +27,12 @@ const CURRENT_SCENE_NAME: &str = "screen_name";
 
 /// The variables of the root timeline that hold the 1-based number of the scene being
 /// shown, in the versions of the engine that have one.
-const CURRENT_SCENE_NUMBERS: [&str; 2] = ["Qpos", "pos"];
+const CURRENT_SCENE_NUMBERS: [&str; 3] = ["Qpos", "pos", CURRENT_SCENE_TO_MOVE_FROM];
+
+/// The variable of the root timeline that holds the 1-based number of the scene being
+/// shown, in the version of the engine whose [`SHOW_SCENE`] moves on from that scene by
+/// the number of scenes it's given, like Hitomi's.
+const CURRENT_SCENE_TO_MOVE_FROM: &str = "Qmod";
 
 /// The variable of the root timeline that holds the number of scenes, in the version of
 /// the engine whose [`SHOW_SCENE`] takes the 1-based number of a scene. The versions
@@ -34,6 +41,19 @@ const SCENE_COUNT: &str = "Qfrm";
 
 /// The most scenes read from a game's scene list.
 const MAX_GAME_SCENES: i32 = 1000;
+
+/// The export name of the movie clip of the main menu, in the version of the engine that
+/// has no scene list: its [`SHOW_SCENE`] attaches the exported movie clip with the name
+/// it's given, and the names of the others start with [`SCENE_CLIP_PREFIX`].
+const MAIN_MENU_CLIP: &str = "mainmenu";
+
+/// The start of the export names of the movie clips of scenes, in the version of the
+/// engine that has no scene list: `screen1`, `screen2`..., and others like `screen_end`.
+const SCENE_CLIP_PREFIX: &str = "screen";
+
+/// The instance name of the movie clip showing the scene, in the version of the engine
+/// that has no scene list.
+const SCENE_CLIP_INSTANCE: &str = "screen";
 
 /// A scene on the root timeline.
 #[derive(Clone, Debug)]
@@ -126,9 +146,9 @@ impl GameScenes {
                 return None;
             }
 
-            let (list, length) = scene_list(object, activation)?;
-            let names: Vec<_> = (0..length)
-                .map(|index| match list.get_element(activation, index) {
+            let list = SceneList::of(root, object, activation)?;
+            let names: Vec<_> = (0..list.len())
+                .map(|index| match list.scene(index, activation) {
                     Value::String(name) => name.to_string(),
                     _ => String::new(),
                 })
@@ -150,6 +170,16 @@ impl GameScenes {
                         _ => None,
                     }
                 })
+            })
+            .or_else(|| match &list {
+                // The clip showing the scene is one of the scenes' clips.
+                SceneList::Clips(clips) => {
+                    let shown = root
+                        .as_container()?
+                        .child_by_name(WStr::from_units(SCENE_CLIP_INSTANCE.as_bytes()), false)?;
+                    clips.iter().position(|(_, id)| *id == shown.id())
+                }
+                SceneList::Array(..) => None,
             });
             Some(Self { names, current })
         })
@@ -178,13 +208,22 @@ impl GameScenes {
             return;
         };
         let scene = Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
-            let (list, length) = scene_list(object, activation)?;
-            let index = i32::try_from(index).ok().filter(|index| *index < length)?;
-            if matches!(stored(object, SCENE_COUNT, activation), Value::Number(_)) {
-                Some(Value::Number(f64::from(index) + 1.0))
-            } else {
-                Some(list.get_element(activation, index))
+            let list = SceneList::of(root, object, activation)?;
+            if index >= list.len() {
+                return None;
             }
+            let number = index as f64 + 1.0;
+            if let SceneList::Clips(_) = list {
+                return Some(list.scene(index, activation));
+            }
+            // Hitomi's version moves on from the current scene by the number it's given, so
+            // it gets how far the scene is from that one.
+            let current = stored(object, CURRENT_SCENE_TO_MOVE_FROM, activation);
+            Some(match (current, stored(object, SCENE_COUNT, activation)) {
+                (Value::Number(current), _) => Value::Number(number - current),
+                (_, Value::Number(_)) => Value::Number(number),
+                _ => list.scene(index, activation),
+            })
         });
         let Some(scene) = scene else {
             return;
@@ -211,20 +250,92 @@ fn stored<'gc>(
         .unwrap_or(Value::Undefined)
 }
 
-/// The game's list of scenes in the root timeline `object`, and how many of them to read.
-fn scene_list<'gc>(
-    object: Avm1Object<'gc>,
-    activation: &mut Activation<'_, 'gc>,
-) -> Option<(Avm1Object<'gc>, i32)> {
-    SCENE_LISTS
-        .iter()
-        .find_map(|name| match stored(object, name, activation) {
-            Value::Object(list) => {
-                let length = list.length(activation).ok().filter(|length| *length > 0)?;
-                Some((list, length.min(MAX_GAME_SCENES)))
-            }
-            _ => None,
+/// The scenes of a game.
+enum SceneList<'gc> {
+    /// The array in one of the [`SCENE_LISTS`] variables, and how many of its scenes to read.
+    Array(Avm1Object<'gc>, i32),
+
+    /// The export names and IDs of the movie clips of the scenes, in the order the game
+    /// numbers them, in the version of the engine that has no scene list.
+    Clips(Vec<(AvmString<'gc>, CharacterId)>),
+}
+
+impl<'gc> SceneList<'gc> {
+    /// The scenes of the game whose root timeline is `root`, with `object`, if it has some.
+    fn of(
+        root: DisplayObject<'gc>,
+        object: Avm1Object<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Option<Self> {
+        let array = SCENE_LISTS
+            .iter()
+            .find_map(|name| match stored(object, name, activation) {
+                Value::Object(list) => {
+                    let length = list.length(activation).ok().filter(|length| *length > 0)?;
+                    Some(Self::Array(list, length.min(MAX_GAME_SCENES)))
+                }
+                _ => None,
+            });
+        array.or_else(|| {
+            let clips = scene_clips(root, activation.context);
+            (!clips.is_empty()).then_some(Self::Clips(clips))
         })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Array(_, length) => *length as usize,
+            Self::Clips(clips) => clips.len(),
+        }
+    }
+
+    /// The scene at `index` (less than [`Self::len`]), as it's listed.
+    fn scene(&self, index: usize, activation: &mut Activation<'_, 'gc>) -> Value<'gc> {
+        match self {
+            Self::Array(list, _) => list.get_element(activation, index as i32),
+            Self::Clips(clips) => Value::String(clips[index].0),
+        }
+    }
+}
+
+/// The export names and IDs of the movie clips that the root timeline `root` exports for
+/// its scenes, in the version of the engine that has no scene list: the main menu, then
+/// `screen1`, `screen2`..., then the others whose names start with `screen_`. There are
+/// none unless numbered ones are there.
+fn scene_clips<'gc>(
+    root: DisplayObject<'gc>,
+    context: &UpdateContext<'gc>,
+) -> Vec<(AvmString<'gc>, CharacterId)> {
+    let Some(library) = context.library.library_for_movie(root.movie()) else {
+        return Vec::new();
+    };
+    let mut clips: Vec<_> = library
+        .export_characters()
+        .iter()
+        .filter(|(_, id)| matches!(library.character_by_id(**id), Some(Character::MovieClip(_))))
+        .filter_map(|(name, id)| {
+            let lower = name.to_string().to_ascii_lowercase();
+            let order = if lower == MAIN_MENU_CLIP {
+                (0, 0)
+            } else {
+                let rest = lower.strip_prefix(SCENE_CLIP_PREFIX)?;
+                match rest.parse::<u32>() {
+                    Ok(number) if rest.bytes().all(|byte| byte.is_ascii_digit()) => (1, number),
+                    _ if rest.starts_with('_') => (2, 0),
+                    _ => return None,
+                }
+            };
+            Some((order, lower, name, *id))
+        })
+        .collect();
+    if !clips.iter().any(|((group, _), ..)| *group == 1) {
+        return Vec::new();
+    }
+    clips.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    clips
+        .into_iter()
+        .map(|(_, _, name, id)| (name, id))
+        .collect()
 }
 
 impl RootTimeline {
@@ -294,6 +405,7 @@ mod tests {
     use crate::player::{Player, PlayerBuilder};
     use crate::tag_utils::SwfMovieData;
     use std::sync::{Arc, Mutex};
+    use swf::avm1::types::{Action, DefineFunction, Push, Value};
 
     fn load_test_swf(name: &str) -> Arc<Mutex<Player>> {
         let path = format!(
@@ -387,6 +499,9 @@ mod tests {
         ByName,
         /// It takes the 1-based number of the scene, and the number of scenes is in `Qfrm`.
         ByNumber,
+        /// It moves on by the number of scenes it's given from the one numbered in `Qmod`,
+        /// and the number of scenes is in `Qfrm`.
+        ByStep,
         /// There's no `setScreen`.
         Missing,
     }
@@ -399,28 +514,20 @@ mod tests {
         current: Option<&'static str>,
         show: ShowScene,
     ) -> Vec<u8> {
-        use swf::avm1::types::{Action, DefineFunction, Push, Value};
-
-        fn actions(actions: &[Action<'_>]) -> Vec<u8> {
-            let mut code = Vec::new();
-            let mut writer = swf::avm1::write::Writer::new(&mut code, 8);
-            for action in actions {
-                writer.write_action(action).unwrap();
-            }
-            code
-        }
-        fn push(values: &[Value<'static>]) -> Action<'static> {
-            Action::Push(Push {
-                values: values.to_vec(),
-            })
-        }
-        let string = |string: &'static str| Value::Str(string.into());
-
         let show_scene = match show {
             // screen_name = name;
             ShowScene::ByName => actions(&[
                 push(&[string("screen_name"), string("name")]),
                 Action::GetVariable,
+                Action::SetVariable,
+            ]),
+            // Qmod = Qmod + name;
+            ShowScene::ByStep => actions(&[
+                push(&[string("Qmod"), string("Qmod")]),
+                Action::GetVariable,
+                push(&[string("name")]),
+                Action::GetVariable,
+                Action::Add2,
                 Action::SetVariable,
             ]),
             // screen_name = <list>[name - 1];
@@ -453,7 +560,7 @@ mod tests {
         if let Some(current) = current {
             setup.extend([push(&[string(current), Value::Int(1)]), Action::DefineLocal]);
         }
-        if matches!(show, ShowScene::ByNumber) {
+        if matches!(show, ShowScene::ByNumber | ShowScene::ByStep) {
             setup.extend([push(&[string("Qfrm"), Value::Int(3)]), Action::DefineLocal]);
         }
         if !matches!(show, ShowScene::Missing) {
@@ -465,14 +572,83 @@ mod tests {
         }
         let mut setup = actions(&setup);
         setup.push(0); // End
+        movie(&[swf::Tag::DoAction(&setup), swf::Tag::ShowFrame])
+    }
 
+    /// A movie that exports an empty movie clip under each of `exports`, and has a
+    /// `setScreen(name)` that attaches the clip exported as `name` as `screen`, which it
+    /// does with `mainmenu` first, like the games without a scene list.
+    fn game_with_scene_clips(exports: &[&'static str]) -> Vec<u8> {
+        // attachMovie(name, "screen", 0);
+        let show_scene = actions(&[
+            push(&[Value::Int(0), string("screen"), string("name")]),
+            Action::GetVariable,
+            push(&[Value::Int(3), string("attachMovie")]),
+            Action::CallFunction,
+            Action::Pop,
+        ]);
+        // function setScreen(name) { ... } setScreen("mainmenu");
+        let mut setup = actions(&[
+            Action::DefineFunction(DefineFunction {
+                name: "setScreen".into(),
+                params: vec!["name".into()],
+                actions: &show_scene,
+            }),
+            push(&[string("mainmenu"), Value::Int(1), string("setScreen")]),
+            Action::CallFunction,
+            Action::Pop,
+        ]);
+        setup.push(0); // End
+
+        let mut tags: Vec<_> = (1..)
+            .zip(exports)
+            .map(|(id, _)| {
+                swf::Tag::DefineSprite(swf::Sprite {
+                    id,
+                    num_frames: 1,
+                    tags: vec![swf::Tag::ShowFrame],
+                })
+            })
+            .collect();
+        tags.push(swf::Tag::ExportAssets(
+            (1..)
+                .zip(exports)
+                .map(|(id, name)| swf::ExportedAsset {
+                    id,
+                    name: (*name).into(),
+                })
+                .collect(),
+        ));
+        tags.extend([swf::Tag::DoAction(&setup), swf::Tag::ShowFrame]);
+        movie(&tags)
+    }
+
+    fn actions(actions: &[Action<'_>]) -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut writer = swf::avm1::write::Writer::new(&mut code, 8);
+        for action in actions {
+            writer.write_action(action).unwrap();
+        }
+        code
+    }
+
+    fn push(values: &[Value<'static>]) -> Action<'static> {
+        Action::Push(Push {
+            values: values.to_vec(),
+        })
+    }
+
+    fn string(string: &'static str) -> Value<'static> {
+        Value::Str(string.into())
+    }
+
+    fn movie(tags: &[swf::Tag<'_>]) -> Vec<u8> {
         let header = swf::Header {
             num_frames: 1,
             ..swf::Header::default_with_swf_version(8)
         };
-        let tags = [swf::Tag::DoAction(&setup), swf::Tag::ShowFrame];
         let mut data = Vec::new();
-        swf::write_swf(&header, &tags, &mut data).unwrap();
+        swf::write_swf(&header, tags, &mut data).unwrap();
         data
     }
 
@@ -482,6 +658,7 @@ mod tests {
             ("scenelist", Some("pos"), ShowScene::ByName),
             ("Qvar", Some("Qpos"), ShowScene::ByName),
             ("Qvar", None, ShowScene::ByNumber),
+            ("Qvar", Some("Qmod"), ShowScene::ByStep),
         ] {
             let player = load_swf(&game_with_scene_list(list, current, show));
             let mut player = player.lock().unwrap();
@@ -501,7 +678,40 @@ mod tests {
             assert_eq!(scenes.current, Some(2), "{list}, {current:?}");
             assert_eq!(scenes.previous(), Some(1));
             assert_eq!(scenes.next(), None);
+
+            player.goto_game_scene(0);
+            let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+            assert_eq!(scenes.current, Some(0), "{list}, {current:?}");
         }
+    }
+
+    #[test]
+    fn navigate_scene_clips() {
+        let player = load_swf(&game_with_scene_clips(&[
+            "screen10",
+            "screen2",
+            "mainmenu",
+            "screen_end",
+            "trans_screen",
+            "screen1",
+            "moregames",
+        ]));
+        let mut player = player.lock().unwrap();
+
+        let scenes = player
+            .root_timeline()
+            .and_then(|timeline| timeline.game_scenes)
+            .expect("the movie's scenes should be its exported clips");
+        assert_eq!(
+            scenes.names,
+            ["mainmenu", "screen1", "screen2", "screen10", "screen_end"]
+        );
+        assert_eq!(scenes.current, Some(0));
+
+        player.goto_game_scene(3);
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(scenes.current, Some(3));
+        assert_eq!(scenes.next(), Some(4));
     }
 
     #[test]
@@ -511,6 +721,11 @@ mod tests {
             Some("pos"),
             ShowScene::Missing,
         ));
+        let mut player = player.lock().unwrap();
+        assert!(player.root_timeline().unwrap().game_scenes.is_none());
+
+        // Without numbered scene clips, the exported clips aren't taken for scenes.
+        let player = load_swf(&game_with_scene_clips(&["mainmenu", "screen_end"]));
         let mut player = player.lock().unwrap();
         assert!(player.root_timeline().unwrap().game_scenes.is_none());
     }
