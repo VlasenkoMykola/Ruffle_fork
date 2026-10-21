@@ -167,8 +167,9 @@ and Baka 1 (Android `030412c`, Windows `e665692b3`). Mortal Combat first did not
 build that set `Qscr`, and many of Hitomi's choices led to the main menu until core gave
 its relative `setScreen` the difference. Avatar's and Hitomi's menus show the games' own
 hashed names, like `540e8d62`. On the user's collection,
-`--classify` finds 532 of 693 games supported, 10 with frame labels only and 151 unknown;
-the user sends samples of the unknown ones first.
+`--classify` found 532 of 693 games supported, 10 with frame labels only and 151 unknown,
+and 576 supported and 107 unknown after the versions above were added (`e665692b3`); the
+user sends samples of the unknown ones first.
 
 ## Frontends
 
