@@ -3,6 +3,7 @@
 
 Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folder> ...]
        python swfinfo.py --classify <folder> [<folder> ...]
+       python swfinfo.py --scenes <file> [<file> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
@@ -21,6 +22,11 @@ handles its scenes: in one of the ways Ruffle's scene menu supports, with frame
 labels only, or in a way it doesn't know yet. SWFs in a subfolder that a game
 names, like parts/, or named by another SWF next to them, are taken for parts of
 that game.
+
+--scenes lists the scenes of games that keep their own list of them, with what the
+movie has under each name: the movie clip the game shows for it, its labels, and
+what its code uses. The code of the main timeline follows, where the game sets up
+the list and switches between its scenes.
 
 Only the Python standard library is needed.
 """
@@ -50,11 +56,11 @@ FILE_LIKE = re.compile(
     r"\.(swf|jpe?g|png|gif|mp3|wav|flv|mp4|xml|txt)\b|^https?:|^\w[\w.-]*/[\w./-]*$", re.I)
 
 # Tag codes
-END, SHOW_FRAME, DEFINE_BUTTON, DO_ACTION, PLACE_OBJECT_2 = 0, 1, 7, 12, 26
+END, SHOW_FRAME, PLACE_OBJECT, DEFINE_BUTTON, DO_ACTION, PLACE_OBJECT_2 = 0, 1, 4, 7, 12, 26
 DEFINE_BUTTON_2, DEFINE_SPRITE, FRAME_LABEL, EXPORT_ASSETS = 34, 39, 43, 56
 IMPORT_ASSETS, DO_INIT_ACTION, FILE_ATTRIBUTES, IMPORT_ASSETS_2 = 57, 59, 69, 71
 DO_ABC_DEFINE, SYMBOL_CLASS, DO_ABC, SCENE_AND_FRAME_LABELS = 72, 76, 82, 86
-DEFINE_BINARY_DATA = 87
+PLACE_OBJECT_3, DEFINE_BINARY_DATA = 70, 87
 
 TAG_NAMES = {
     0: "End", 1: "ShowFrame", 2: "DefineShape", 4: "PlaceObject", 5: "RemoveObject",
@@ -790,14 +796,33 @@ class Timeline:
         return actions
 
     def placed_code(self, where, start, end):
+        actions = Actions()
         try:
             handlers = clip_actions(self.data, start, end, self.version)
         except (IndexError, ValueError, struct.error):
-            return
+            return actions
         for depth, events, code_start, code_end in handlers:
-            self.nested.scan(self.data, code_start, code_end)
+            actions.scan(self.data, code_start, code_end)
             self.blocks.append((f"{where}, onClipEvent({events}) of the clip at depth {depth}",
                                 code_start, code_end))
+        self.nested.merge(actions)
+        return actions
+
+
+def placed_character(code, data, start):
+    """The ID of the character that a PlaceObject tag places, if it names one."""
+    if code == PLACE_OBJECT:
+        return struct.unpack_from("<H", data, start)[0]
+    flags = data[start]
+    reader = Reader(data, start + 1)
+    if code == PLACE_OBJECT_3:
+        flags_2 = reader.u8()
+        reader.u16()  # Depth
+        if flags_2 & 0x08 or (flags_2 & 0x10 and flags & 0x02):
+            reader.cstring()  # Class name
+    else:
+        reader.u16()  # Depth
+    return reader.u16() if flags & 0x02 else None
 
 
 def not_swf_kind(data):
@@ -840,6 +865,8 @@ class Movie:
         # Embedded: (character ID, start, end) of SWFs in binary data
         self.symbol_names, self.embedded = {}, []
         self.sprites = []  # (ID, frame count, labels)
+        # Strings in the code of each clip and button, and the characters placed in each clip
+        self.own_strings, self.children = {}, {}
         self.exports, self.imports = {}, []
         self.tag_counts = {}
         frame = 1
@@ -862,17 +889,25 @@ class Movie:
                 timeline.placed_code(f"frame {frame}", start, end)
             elif code == DO_INIT_ACTION:
                 sprite_id = struct.unpack_from("<H", body, start)[0]
-                nested.scan(body, start + 2, end)
+                init = Actions()
+                init.scan(body, start + 2, end)
+                nested.merge(init)
+                self.own_strings.setdefault(sprite_id, []).extend(init.strings)
                 blocks.append((f"#initclip of clip #{sprite_id}", start + 2, end))
             elif code in (DEFINE_BUTTON, DEFINE_BUTTON_2):
                 button_id = struct.unpack_from("<H", body, start)[0]
                 find = button_1_actions if code == DEFINE_BUTTON else button_2_actions
                 for block_start, block_end in find(body, start, end):
-                    nested.scan(body, block_start, block_end)
+                    button = Actions()
+                    button.scan(body, block_start, block_end)
+                    nested.merge(button)
+                    self.own_strings.setdefault(button_id, []).extend(button.strings)
                     blocks.append((f"button #{button_id}", block_start, block_end))
             elif code == DEFINE_SPRITE:
                 sprite_id, sprite_frames = struct.unpack_from("<HH", body, start)
                 sprite = Timeline(body, self.version, nested, nested, blocks)
+                own = Actions()
+                children = self.children.setdefault(sprite_id, set())
                 labels, sub_frame = [], 1
                 for sub_code, sub_start, sub_end in read_tags(body, start + 4, end):
                     if sub_code == SHOW_FRAME:
@@ -880,9 +915,17 @@ class Movie:
                     elif sub_code == FRAME_LABEL:
                         labels.append((sub_frame, Reader(body, sub_start).cstring()))
                     elif sub_code == DO_ACTION:
-                        sprite.frame_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
-                    elif sub_code == PLACE_OBJECT_2:
-                        sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end)
+                        own.merge(sprite.frame_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end))
+                    if sub_code == PLACE_OBJECT_2:
+                        own.merge(sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end))
+                    if sub_code in (PLACE_OBJECT, PLACE_OBJECT_2, PLACE_OBJECT_3):
+                        try:
+                            child = placed_character(sub_code, body, sub_start)
+                        except (IndexError, struct.error):
+                            child = None
+                        if child is not None:
+                            children.add(child)
+                self.own_strings.setdefault(sprite_id, []).extend(own.strings)
                 self.sprites.append((sprite_id, sprite_frames, labels))
             elif code == EXPORT_ASSETS:
                 reader = Reader(body, start)
@@ -1036,18 +1079,29 @@ SUPPORTED, LABELS_ONLY, UNKNOWN, UNREADABLE = (
     "supported", "frame labels only", "unknown", "couldn't read")
 
 
-def scene_count(movie):
-    """How many scenes a game's own scene list has, if the code says."""
+def game_scene_list(movie):
+    """(where the code keeps it, names) of a game's own scene list, if the code has it."""
     for name, values in movie.main.arrays:
         if name in ("Qvar", "scenelist"):
-            return len(values)
-    # Some versions split a string of the scene names, which are exported symbols.
-    exported = set(movie.exports.values())
-    for string in movie.main.strings:
+            return f"an array in {name}", values
+    # Some versions split a string of the scene names, which are exported symbols (which
+    # Flash looks up ignoring case). Take the one naming the most.
+    exported = {name.lower() for name in movie.exports.values()}
+    best, best_count = None, 1
+    for string in dedupe(movie.main.strings):
         names = string.split(",")
-        if len(names) > 1 and all(name in exported for name in names):
-            return len(names)
+        count = sum(1 for name in names if name.lower() in exported)
+        if len(names) > 1 and count > best_count:
+            best, best_count = names, count
+    if best:
+        return "a string of names separated by commas", best
     return None
+
+
+def scene_count(movie):
+    """How many scenes a game's own scene list has, if the code says."""
+    scene_list = game_scene_list(movie)
+    return len(scene_list[1]) if scene_list else None
 
 
 def scene_method(movie):
@@ -1074,6 +1128,65 @@ def scene_method(movie):
     if labelled:
         hints.append(f"{labelled} movie clips with frame labels")
     return UNKNOWN, f"unknown method for handling scenes in this game ({'; '.join(hints)})"
+
+
+def describe_scenes(path):
+    """Prints the scenes of a game that keeps its own list of them, and the code that shows them."""
+    name = os.path.basename(path)
+    data = open(path, "rb").read()
+    if len(data) <= 8 or decompress(data) is None:
+        print(f"== {name}: not a SWF ({not_swf_kind(data)})")
+        return
+    m = Movie(data)
+    print(f"== {name}: {scene_method(m)[1]}")
+    scene_list = game_scene_list(m)
+    if scene_list:
+        where, names = scene_list
+        print(f"   the list ({len(names)} scenes) is {where} in the code of the main timeline")
+        if "Qfrm" not in m.main.strings:
+            print("   its scenes are in the parts it loads, so this file can't tell more about them: "
+                  + limited(names, repr))
+            names = []
+        by_export = {export.lower(): character for character, export in m.exports.items()}
+        sprites = {sprite_id: (frames, labels) for sprite_id, frames, labels in m.sprites}
+        # Names that tell how a scene's code works with the main timeline: its functions,
+        # and the engine's variables.
+        functions = set(m.main.functions)
+        known = re.compile(r"^(Q[a-z]{2,4}|screen_name|pos|scenelist|scenepart)$")
+
+        def uses(strings):
+            return dedupe(s for s in strings if s in functions or known.match(s))
+
+        for number, scene in enumerate(names, 1):
+            character = by_export.get(str(scene).lower())
+            if character is None:
+                print(f"   {number}. {scene!r}: no clip of this name in this file")
+                continue
+            if character not in sprites:
+                print(f"   {number}. {scene!r}: #{character}, which isn't a movie clip")
+                continue
+            frames, labels = sprites[character]
+            label_text = f", labels {format_labels(labels, MAX_CLIP_LABELS)}" if labels else ""
+            print(f"   {number}. {scene!r}: clip #{character}, {frames} frames{label_text}")
+            own = uses(m.own_strings.get(character, []))
+            if own:
+                print(f"         its code uses {', '.join(own)}")
+            inside, seen, queue = [], {character}, list(m.children.get(character, ()))
+            while queue:
+                child = queue.pop()
+                if child in seen:
+                    continue
+                seen.add(child)
+                inside += m.own_strings.get(child, [])
+                queue += m.children.get(child, ())
+            inside = uses(inside)
+            if inside:
+                print(f"         code of the clips and buttons in it uses {', '.join(inside)}")
+    for title, start, end in m.blocks:
+        if title.startswith("frame "):
+            print(f"   -- {title} ({end - start} bytes)")
+            for line in disassemble(m.body, start, end):
+                print("      " + line)
 
 
 def classify(args):
@@ -1159,8 +1272,8 @@ def classify(args):
 
 def main(args):
     dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
-    classifying = "--classify" in args
-    args = [arg for arg in args if arg not in ("--dump", "--dump-main", "--classify")]
+    classifying, scenes = "--classify" in args, "--scenes" in args
+    args = [arg for arg in args if arg not in ("--dump", "--dump-main", "--classify", "--scenes")]
     if not args:
         print(__doc__)
         return 1
@@ -1170,6 +1283,13 @@ def main(args):
         pass
     if classifying:
         return classify(args)
+    if scenes:
+        for path in args:
+            try:
+                describe_scenes(path)
+            except Exception as e:  # Keep going, so one odd file doesn't hide the rest
+                print(f"== {os.path.basename(path)}  (couldn't read: {type(e).__name__}: {e})")
+        return 0
     files = []
     for arg in args:
         if os.path.isdir(arg):

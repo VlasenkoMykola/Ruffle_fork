@@ -111,7 +111,9 @@ Other games:
 User testing so far: Nice Christmas 2, Olympic Contest, Titans 2 and Mortal Combat switch
 scenes. Mortal Combat first did nothing, on the build that set `Qscr`; it works since
 Android `6b41de4` (Windows `09eaca375`), which call `setScreen` and pass a number to the
-`Qfrm` version. Avatar and Hitomi haven't been tested yet. On the user's collection,
+`Qfrm` version. In Avatar the menu shows hashed names like `540e8d62`, and most lead to a
+scene; in Hitomi many lead to the main menu instead. `--scenes` was written to find out
+why (see below). On the user's collection,
 `--classify` finds most SWF games supported and many unknown; the user sends samples of the
 unknown ones first.
 
@@ -140,6 +142,9 @@ output they paste back, since the games themselves aren't shared:
 - `--classify <folders>`: one line per game on how it handles scenes (supported, frame
   labels only, unknown, unreadable), and a tally. SWFs in a subfolder that a game names
   (like `parts/`), or named by another SWF next to them, count as its parts.
+- `--scenes <files>`: for games with their own scene list, each entry with the clip the
+  movie exports under that name (frames, labels, which engine functions and variables its
+  code and the code inside it use), or that it has none; then the main timeline's code.
 
 It reads AVM1 code the way it runs (following jumps, branches and functions), so junk after
 jumps doesn't hide code, and it ignores garbled constant pools as decoys. Changes are best
