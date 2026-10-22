@@ -184,6 +184,12 @@ Other games:
   `--classify` takes `setScreen` from the names in the code too, since `467e51a2a`. Tifa
   and Kasumi name their main menu `main_menu`, which core lists first since then; their
   `end` clips aren't listed.
+- **Matsumoto vs. Tsunade**: a launcher that only loads `parts/mvt0_1_2` over itself; the
+  part has the scene code (the menu works). `--classify` judges launchers by the scene code
+  of the parts they name (up to 6 read) since this was found.
+- **Metropolis Files** 1 to 4: another engine (4 KB launchers with `GameFile`, `show_dialog`,
+  `srv_send_screen`, `XMLSocketWrapper`, `LoadVarsWrapper`, `loadClip` from a `papka`
+  folder under `parts/`), not supported yet; its code was asked for.
 - **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
   supporting.
 

@@ -1313,13 +1313,14 @@ def describe_scenes(path):
 
 
 def launcher_method(path, movie):
-    """(status, description) of a launcher that keeps its scene list in _global for the parts
-    it loads over itself, if one of those parts has the code that switches scenes."""
+    """(status, description) of a launcher, from the parts it names (that it loads over
+    itself): supported when it keeps its scene list in _global and a part has the code that
+    switches scenes, like Big Queen 1, or as a part's own code handles its scenes, like
+    Matsumoto vs. Tsunade's. None when no part tells."""
     lists = [(name, values) for name, values in movie.main.arrays if name in LAUNCHER_LISTS]
-    if not lists:
-        return None
-    name, scenes = lists[0]
     folder = os.path.dirname(os.path.abspath(path))
+    found = None
+    read = 0
     # Parts are named like "parts/btmq0", or "parts/esrm" with the number added in code.
     for string in dedupe(movie.main.strings):
         if not re.fullmatch(r"[\w.-]+(/[\w.-]+)+", string):
@@ -1330,15 +1331,26 @@ def launcher_method(path, movie):
         except OSError:
             continue
         for part in [n for n in names if n.lower().startswith(prefix.lower())][:3]:
+            if read >= 6:  # Enough to tell, for launchers that name many files
+                return found
+            read += 1
             try:
                 data = open(os.path.join(directory, part), "rb").read()
                 part_movie = Movie(data) if len(data) > 8 and decompress(data) else None
             except Exception:  # A part that can't be read doesn't make the game unreadable
                 continue
-            if part_movie and has_set_screen(part_movie):
+            if not part_movie:
+                continue
+            if lists and has_set_screen(part_movie):
+                name, scenes = lists[0]
                 return SUPPORTED, (f"its own scene list, in {LAUNCHER_LISTS[name]} version of its "
                                    f"engine, {len(scenes)} scenes, switched by its parts")
-    return None
+            status, description = scene_method(part_movie)
+            if status == SUPPORTED:
+                return status, f"{description}, in its part {part}"
+            if status != UNKNOWN and not found:
+                found = status, f"{description}, in its part {part}"
+    return found
 
 
 def classify(args, unsupported_only=False, names_only=False, max_depth=None):
