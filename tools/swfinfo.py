@@ -1167,10 +1167,15 @@ def game_scene_list(movie):
     return None
 
 
+def has_function(movie, name):
+    """Whether a movie's main timeline has a function, defined by that name, or under another
+    one, as in protected games, and set to that name."""
+    return name in movie.main.functions or name in movie.main.strings + movie.nested.strings
+
+
 def has_set_screen(movie):
-    """Whether a movie's main timeline has the engine's setScreen, defined by that name, or
-    under another one, as in protected games, and set to setScreen."""
-    return "setScreen" in movie.main.functions or "setScreen" in movie.main.strings + movie.nested.strings
+    """Whether a movie's main timeline has the engine's setScreen."""
+    return has_function(movie, "setScreen")
 
 
 def scene_clips(movie):
@@ -1228,6 +1233,12 @@ def scene_method(movie):
                            f"engine, {len(clips)} scenes")
     if len(movie.scenes) > 1:
         return SUPPORTED, f"{len(movie.scenes)} scenes on the main timeline"
+    # Launchers that load all their parts at once, which report their scenes when loaded,
+    # and srv_send_screen shows the part with the scene and calls its gotoScreen
+    if "srv_send_screen" in movie.main.functions and "files" in movie.main.strings:
+        parts = [values for name, values in movie.main.arrays if name == "files"]
+        details = f" ({', '.join(map(str, parts[0]))})" if parts else ""
+        return SUPPORTED, f"its parts' scene lists, in Metropolis Files' version of its engine{details}"
     if movie.labels:
         return LABELS_ONLY, f"no scenes, {len(movie.labels)} frame labels on the main timeline"
     jumps = frame_jumps(movie)

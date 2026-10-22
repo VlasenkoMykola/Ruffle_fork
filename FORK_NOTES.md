@@ -187,9 +187,19 @@ Other games:
 - **Matsumoto vs. Tsunade**: a launcher that only loads `parts/mvt0_1_2` over itself; the
   part has the scene code (the menu works). `--classify` judges launchers by the scene code
   of the parts they name (up to 6 read) since this was found.
-- **Metropolis Files** 1 to 4: another engine (4 KB launchers with `GameFile`, `show_dialog`,
-  `srv_send_screen`, `XMLSocketWrapper`, `LoadVarsWrapper`, `loadClip` from a `papka`
-  folder under `parts/`), not supported yet; its code was asked for.
+- **Metropolis Files** 1 to 4: another version (4 KB protected launchers). The launcher sets
+  `papka = "parts/"`, `files = ["mmtxf1", "mmtxf2"]` and `start_file = {name: "mmtxf2",
+  screen: "screen_0"}`, and `GameFile(name)` loads every part at once with `loadClip` into
+  its own clip (`_lockroot`, hidden but for the start part). The parts talk to the launcher
+  through a fake `XMLSocket` (`XMLSocketWrapper`; `LoadVarsWrapper` answers their
+  `LoadVars`): a message of four comma-separated fields reports the part's scenes in the
+  last one, `;`-separated, which `srv_socket_recv` keeps in the part's `screens`; any other
+  message is a scene to go to. `srv_send_screen(name)` finds the part whose `screens` has
+  it, swaps it in as the visible `cur_file`, and calls `cur_file.clip.gotoScreen(name)`.
+  `Array_indexOf` only finds anything when `_url.substring(2, 4) == "le"` (a `file://`
+  URL). Core lists the scenes the parts reported (sorted by number when all have one),
+  takes the current one from `cur_file.clip.screen_name`, and switches with
+  `srv_send_screen(name)`; untested by the user so far.
 - **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
   supporting.
 

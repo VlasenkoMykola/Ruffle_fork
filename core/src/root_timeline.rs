@@ -60,6 +60,20 @@ const MAIN_MENU_CLIPS: [&str; 2] = ["mainmenu", "main_menu"];
 /// and others like `screen_end`.
 const SCENE_CLIP_PREFIX: &str = "screen";
 
+/// The function of the root timeline that shows the scene with the given name, in the
+/// version of the engine whose launcher loads all its parts at once, like Metropolis
+/// Files': it shows the part that has the scene, and calls the part's `gotoScreen`.
+const SHOW_SCENE_IN_PARTS: &str = "srv_send_screen";
+
+/// The variable of the root timeline that holds the parts, in that version: an array of
+/// objects, each with the names of the part's scenes in `screens`, which the part reports
+/// once it has loaded.
+const SCENE_PARTS: &str = "files";
+
+/// The variable of the root timeline that holds the part being shown, in that version,
+/// whose movie clip is in `clip`.
+const CURRENT_SCENE_PART: &str = "cur_file";
+
 /// The instance name of the movie clip showing the scene, in the version of the engine
 /// that has no scene list.
 const SCENE_CLIP_INSTANCE: &str = "screen";
@@ -158,12 +172,6 @@ impl GameScenes {
     ) -> Option<Self> {
         let object = root.object1()?;
         Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
-            let show_scene = stored(object, SHOW_SCENE, activation);
-            if !matches!(show_scene, Value::Object(show_scene) if show_scene.as_function().is_some())
-            {
-                return None;
-            }
-
             let list = SceneList::of(root, object, activation)?;
             let names: Vec<_> = (0..list.len())
                 .map(|index| match list.scene(index, activation) {
@@ -196,6 +204,20 @@ impl GameScenes {
                         .as_container()?
                         .child_by_name(WStr::from_units(SCENE_CLIP_INSTANCE.as_bytes()), false)?;
                     clips.iter().position(|(_, id)| *id == shown.id())
+                }
+                // The part being shown keeps the name of its scene, like the other versions.
+                SceneList::Parts(_) => {
+                    let Value::Object(part) = stored(object, CURRENT_SCENE_PART, activation) else {
+                        return None;
+                    };
+                    let Value::Object(clip) = stored(part, "clip", activation) else {
+                        return None;
+                    };
+                    let Value::String(name) = stored(clip, CURRENT_SCENE_NAME, activation) else {
+                        return None;
+                    };
+                    let name = name.to_string();
+                    names.iter().position(|scene| *scene == name)
                 }
                 SceneList::Array(..) => None,
             });
@@ -231,19 +253,21 @@ impl GameScenes {
                 return None;
             }
             let number = index as f64 + 1.0;
-            if let SceneList::Clips(_) = list {
-                return Some(list.scene(index, activation));
+            let show_scene = list.show_scene();
+            if let SceneList::Clips(_) | SceneList::Parts(_) = list {
+                return Some((list.scene(index, activation), show_scene));
             }
             // Hitomi's version moves on from the current scene by the number it's given, so
             // it gets how far the scene is from that one.
             let current = variable(object, CURRENT_SCENE_TO_MOVE_FROM, activation);
-            Some(match (current, variable(object, SCENE_COUNT, activation)) {
+            let scene = match (current, variable(object, SCENE_COUNT, activation)) {
                 (Value::Number(current), _) => Value::Number(number - current),
                 (_, Value::Number(_)) => Value::Number(number),
                 _ => list.scene(index, activation),
-            })
+            };
+            Some((scene, show_scene))
         });
-        let Some(scene) = scene else {
+        let Some((scene, show_scene)) = scene else {
             return;
         };
 
@@ -251,7 +275,7 @@ impl GameScenes {
         // mouse cursor, which some scenes hide.
         context.stop_all_sounds();
         context.ui.set_mouse_visible(true);
-        let show_scene = AvmString::new_utf8(context.gc(), SHOW_SCENE);
+        let show_scene = AvmString::new_utf8(context.gc(), show_scene);
         Avm1::run_stack_frame_for_method(root, object, show_scene, &[scene], context);
     }
 }
@@ -266,6 +290,20 @@ fn stored<'gc>(
     object
         .get_stored(name, activation)
         .unwrap_or(Value::Undefined)
+}
+
+/// Whether `value` is a function.
+fn is_function(value: Value<'_>) -> bool {
+    matches!(value, Value::Object(object) if object.as_function().is_some())
+}
+
+/// The number of a scene named like `screen1` or `screen_1`, in lowercase.
+fn scene_number(lower_name: &str) -> Option<u32> {
+    let rest = lower_name.strip_prefix(SCENE_CLIP_PREFIX)?;
+    let digits = rest.strip_prefix('_').unwrap_or(rest);
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
 }
 
 /// The value of the engine's variable `name`: the root timeline `object`'s, or else
@@ -289,15 +327,26 @@ enum SceneList<'gc> {
     /// The export names and IDs of the movie clips of the scenes, in the order the game
     /// numbers them, in the version of the engine that has no scene list.
     Clips(Vec<(AvmString<'gc>, CharacterId)>),
+
+    /// The names of the scenes that the parts in [`SCENE_PARTS`] reported, in the version
+    /// of the engine that loads them all at once.
+    Parts(Vec<AvmString<'gc>>),
 }
 
 impl<'gc> SceneList<'gc> {
-    /// The scenes of the game whose root timeline is `root`, with `object`, if it has some.
+    /// The scenes of the game whose root timeline is `root`, with `object`, if it has some,
+    /// and the function that shows them.
     fn of(
         root: DisplayObject<'gc>,
         object: Avm1Object<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Option<Self> {
+        if is_function(stored(object, SHOW_SCENE_IN_PARTS, activation)) {
+            return Self::parts(object, activation);
+        }
+        if !is_function(stored(object, SHOW_SCENE, activation)) {
+            return None;
+        }
         let array = SCENE_LISTS
             .iter()
             .find_map(|name| match variable(object, name, activation) {
@@ -313,10 +362,53 @@ impl<'gc> SceneList<'gc> {
         })
     }
 
+    /// The names of the scenes that the parts in [`SCENE_PARTS`] of the root timeline
+    /// `object` reported, sorted by their numbers when they all have one.
+    fn parts(object: Avm1Object<'gc>, activation: &mut Activation<'_, 'gc>) -> Option<Self> {
+        let Value::Object(parts) = stored(object, SCENE_PARTS, activation) else {
+            return None;
+        };
+        let mut names = Vec::new();
+        let part_count = parts.length(activation).unwrap_or(0).min(MAX_GAME_SCENES);
+        for part in 0..part_count {
+            let Value::Object(part) = parts.get_element(activation, part) else {
+                continue;
+            };
+            let Value::Object(screens) = stored(part, "screens", activation) else {
+                continue;
+            };
+            let screen_count = screens.length(activation).unwrap_or(0).min(MAX_GAME_SCENES);
+            for screen in 0..screen_count {
+                if let Value::String(name) = screens.get_element(activation, screen) {
+                    names.push(name);
+                }
+            }
+        }
+        let numbers: Option<Vec<_>> = names
+            .iter()
+            .map(|name| scene_number(&name.to_string().to_ascii_lowercase()))
+            .collect();
+        if let Some(numbers) = numbers {
+            let mut numbered: Vec<_> = numbers.into_iter().zip(names).collect();
+            numbered.sort_by_key(|(number, _)| *number);
+            names = numbered.into_iter().map(|(_, name)| name).collect();
+        }
+        (!names.is_empty()).then_some(Self::Parts(names))
+    }
+
+    /// The function of the root timeline that shows a scene.
+    fn show_scene(&self) -> &'static str {
+        match self {
+            Self::Parts(_) => SHOW_SCENE_IN_PARTS,
+            _ => SHOW_SCENE,
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Array(_, length) => *length as usize,
             Self::Clips(clips) => clips.len(),
+            Self::Parts(names) => names.len(),
         }
     }
 
@@ -325,6 +417,7 @@ impl<'gc> SceneList<'gc> {
         match self {
             Self::Array(list, _) => list.get_element(activation, index as i32),
             Self::Clips(clips) => Value::String(clips[index].0),
+            Self::Parts(names) => Value::String(names[index]),
         }
     }
 }
@@ -351,12 +444,10 @@ fn scene_clips<'gc>(
                 (0, 0)
             } else {
                 let rest = lower.strip_prefix(SCENE_CLIP_PREFIX)?;
-                // `screen1` or `screen_1`
-                let digits = rest.strip_prefix('_').unwrap_or(rest);
-                match digits.parse::<u32>() {
-                    Ok(number) if digits.bytes().all(|byte| byte.is_ascii_digit()) => (1, number),
-                    _ if rest.starts_with('_') => (2, 0),
-                    _ => return None,
+                match scene_number(&lower) {
+                    Some(number) => (1, number),
+                    None if rest.starts_with('_') => (2, 0),
+                    None => return None,
                 }
             };
             Some((order, lower, name, *id))
@@ -1142,6 +1233,95 @@ mod tests {
         player.goto_and_play_root_frame(next.start);
         let timeline = player.root_timeline().unwrap();
         assert_eq!(timeline.current_scene(), Some(1));
+    }
+
+    /// A movie laid out like Metropolis Files' launcher, whose parts have reported their
+    /// scenes: `files` holds two parts, with `screens` and a `clip` that keeps the name of
+    /// the scene shown in `screen_name`, and `srv_send_screen(name)` shows a scene.
+    fn game_with_scene_parts() -> Vec<u8> {
+        // cur_file.clip.screen_name = name;
+        let show_scene = actions(&[
+            push(&[string("cur_file")]),
+            Action::GetVariable,
+            push(&[string("clip")]),
+            Action::GetMember,
+            push(&[string("screen_name"), string("name")]),
+            Action::GetVariable,
+            Action::SetMember,
+        ]);
+        // var <part> = new Object(); <part>.screens = [...]; <part>.clip = new Object();
+        let part = |name: &'static str, screens: [&'static str; 2]| {
+            [
+                push(&[string(name), Value::Int(0), string("Object")]),
+                Action::NewObject,
+                Action::DefineLocal,
+                push(&[string(name)]),
+                Action::GetVariable,
+                push(&[
+                    string("screens"),
+                    string(screens[1]),
+                    string(screens[0]),
+                    Value::Int(2),
+                ]),
+                Action::InitArray,
+                Action::SetMember,
+                push(&[string(name)]),
+                Action::GetVariable,
+                push(&[string("clip"), Value::Int(0), string("Object")]),
+                Action::NewObject,
+                Action::SetMember,
+            ]
+        };
+        let mut setup = Vec::new();
+        setup.extend(part("first", ["screen_1", "screen_0"]));
+        setup.extend(part("second", ["screen_3", "screen_2"]));
+        // var files = [first, second]; var cur_file = first; first.clip.screen_name = "screen_0";
+        setup.extend([
+            push(&[string("files"), string("second")]),
+            Action::GetVariable,
+            push(&[string("first")]),
+            Action::GetVariable,
+            push(&[Value::Int(2)]),
+            Action::InitArray,
+            Action::DefineLocal,
+            push(&[string("cur_file"), string("first")]),
+            Action::GetVariable,
+            Action::DefineLocal,
+            push(&[string("first")]),
+            Action::GetVariable,
+            push(&[string("clip")]),
+            Action::GetMember,
+            push(&[string("screen_name"), string("screen_0")]),
+            Action::SetMember,
+            Action::DefineFunction(DefineFunction {
+                name: "srv_send_screen".into(),
+                params: vec!["name".into()],
+                actions: &show_scene,
+            }),
+        ]);
+        let mut setup = actions(&setup);
+        setup.push(0); // End
+        movie(&[swf::Tag::DoAction(&setup), swf::Tag::ShowFrame])
+    }
+
+    #[test]
+    fn navigate_scenes_of_parts() {
+        let player = load_swf(&game_with_scene_parts());
+        let mut player = player.lock().unwrap();
+
+        let scenes = player
+            .root_timeline()
+            .and_then(|timeline| timeline.game_scenes)
+            .expect("the movie's scenes should be the ones its parts reported");
+        assert_eq!(
+            scenes.names,
+            ["screen_0", "screen_1", "screen_2", "screen_3"]
+        );
+        assert_eq!(scenes.current, Some(0));
+
+        player.goto_game_scene(3);
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(scenes.current, Some(3));
     }
 
     #[test]
