@@ -181,9 +181,9 @@ Other games:
 - **Lara Kroft Commando Recon**, **Tifa's Happy Xmas** and **Kasumi Training**: the version
   without a list, protected: their main timeline's functions have garbled names like `♦♣`,
   while `setScreen` is still there by name when they run (the menu worked in all three).
-  `--classify` takes `setScreen` from the names in the code too, since `6b2dbd238`'s
-  successor. Tifa and Kasumi name their main menu `main_menu`, which core lists first since
-  then; their `end` clips aren't listed.
+  `--classify` takes `setScreen` from the names in the code too, since `467e51a2a`. Tifa
+  and Kasumi name their main menu `main_menu`, which core lists first since then; their
+  `end` clips aren't listed.
 - **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
   supporting.
 
