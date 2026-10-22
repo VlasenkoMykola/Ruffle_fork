@@ -1162,9 +1162,15 @@ def game_scene_list(movie):
     if best:
         return "a string of names separated by commas, in the code of the main timeline", best
     clips = scene_clips(movie)
-    if clips and "setScreen" in movie.main.functions:
+    if clips and has_set_screen(movie):
         return "the movie clips it exports for its scenes, as it has no list", clips
     return None
+
+
+def has_set_screen(movie):
+    """Whether a movie's main timeline has the engine's setScreen, defined by that name, or
+    under another one, as in protected games, and set to setScreen."""
+    return "setScreen" in movie.main.functions or "setScreen" in movie.main.strings + movie.nested.strings
 
 
 def scene_clips(movie):
@@ -1178,7 +1184,7 @@ def scene_clips(movie):
         lower = name.lower()
         if character not in sprites:
             continue
-        if lower == "mainmenu":
+        if lower in ("mainmenu", "main_menu"):
             order = (0, 0)
         elif re.fullmatch(r"screen_?\d+", lower):  # screen1, or screen_1 as in Universal Soldier
             order = (1, int(lower[len("screen"):].lstrip("_")))
@@ -1211,13 +1217,13 @@ def frame_jumps(movie):
 def scene_method(movie):
     """How a movie handles its scenes, as (status, description)."""
     strings = set(movie.main.strings)
-    if "setScreen" in movie.main.functions and strings & set(SCENE_LISTS):
+    if has_set_screen(movie) and strings & set(SCENE_LISTS):
         version = next(version for variable, version in ENGINE_VERSIONS if variable in strings)
         count = scene_count(movie)
         details = f", {count} scenes" if count else ""
         return SUPPORTED, f"its own scene list, in {version} version of its engine{details}"
     clips = scene_clips(movie)
-    if "setScreen" in movie.main.functions and clips:
+    if has_set_screen(movie) and clips:
         return SUPPORTED, (f"its own scene clips, in Avatar The Last Airbender's version of its "
                            f"engine, {len(clips)} scenes")
     if len(movie.scenes) > 1:
@@ -1329,7 +1335,7 @@ def launcher_method(path, movie):
                 part_movie = Movie(data) if len(data) > 8 and decompress(data) else None
             except Exception:  # A part that can't be read doesn't make the game unreadable
                 continue
-            if part_movie and "setScreen" in part_movie.main.functions:
+            if part_movie and has_set_screen(part_movie):
                 return SUPPORTED, (f"its own scene list, in {LAUNCHER_LISTS[name]} version of its "
                                    f"engine, {len(scenes)} scenes, switched by its parts")
     return None

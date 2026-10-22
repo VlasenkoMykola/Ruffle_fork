@@ -49,10 +49,11 @@ const SCENE_COUNT: &str = "Qfrm";
 /// The most scenes read from a game's scene list.
 const MAX_GAME_SCENES: i32 = 1000;
 
-/// The export name of the movie clip of the main menu, in the version of the engine that
+/// The export names of the movie clip of the main menu, in the version of the engine that
 /// has no scene list: its [`SHOW_SCENE`] attaches the exported movie clip with the name
-/// it's given, and the names of the others start with [`SCENE_CLIP_PREFIX`].
-const MAIN_MENU_CLIP: &str = "mainmenu";
+/// it's given, and the names of the others start with [`SCENE_CLIP_PREFIX`]. Some games,
+/// like Tifa's Happy Xmas, call it `main_menu`.
+const MAIN_MENU_CLIPS: [&str; 2] = ["mainmenu", "main_menu"];
 
 /// The start of the export names of the movie clips of scenes, in the version of the
 /// engine that has no scene list: `screen1`, `screen2`... (or `screen_1`, `screen_2`...),
@@ -346,7 +347,7 @@ fn scene_clips<'gc>(
         .filter(|(_, id)| matches!(library.character_by_id(**id), Some(Character::MovieClip(_))))
         .filter_map(|(name, id)| {
             let lower = name.to_string().to_ascii_lowercase();
-            let order = if lower == MAIN_MENU_CLIP {
+            let order = if MAIN_MENU_CLIPS.contains(&lower.as_str()) {
                 (0, 0)
             } else {
                 let rest = lower.strip_prefix(SCENE_CLIP_PREFIX)?;
@@ -987,14 +988,16 @@ mod tests {
         assert_eq!(scenes.current, Some(3));
         assert_eq!(scenes.next(), Some(4));
 
-        // Universal Soldier's names, without a main menu
+        // Names with underscores, like Universal Soldier's and Tifa's Happy Xmas's
         let player = load_swf(&game_with_scene_clips(&[
             "screen_failed",
             "screen_10",
             "screen_1",
             "trans_screen",
             "screen_2",
+            "main_menu",
             "mainmenu_bg",
+            "end",
         ]));
         let mut player = player.lock().unwrap();
         let scenes = player
@@ -1003,7 +1006,13 @@ mod tests {
             .expect("the movie's scenes should be its exported clips");
         assert_eq!(
             scenes.names,
-            ["screen_1", "screen_2", "screen_10", "screen_failed"]
+            [
+                "main_menu",
+                "screen_1",
+                "screen_2",
+                "screen_10",
+                "screen_failed"
+            ]
         );
     }
 

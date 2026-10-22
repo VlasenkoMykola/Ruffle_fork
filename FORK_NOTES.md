@@ -90,7 +90,8 @@ What's known about each, from `tools/swfinfo.py` dumps:
 
 0. **Version without a list** (Avatar The Last Airbender, Baka 1, Wheel of Wonder, Universal
    Soldier, Tripping the Rift Six Satisfaction). One SWF, whose scenes are movie clips
-   exported as `mainmenu`, `screen1`... (plus `screen_end` or `screen_failed`), or as
+   exported as `mainmenu` (or `main_menu`), `screen1`... (plus `screen_end`, `screen_failed`,
+   `screen_demo`, `screen_1_1`...), or as
    `screen_0`, `screen_1`... in Universal Soldier (whose `Qscr` n is `"screen_" + (n - 1)`)
    and Tripping the Rift (which starts at `setScreen("screen_5")`).
    `setScreen(clip_name)` removes `screen` and attaches the clip as `screen` on the root;
@@ -177,6 +178,12 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
 
 Other games:
 
+- **Lara Kroft Commando Recon**, **Tifa's Happy Xmas** and **Kasumi Training**: the version
+  without a list, protected: their main timeline's functions have garbled names like `♦♣`,
+  while `setScreen` is still there by name when they run (the menu worked in all three).
+  `--classify` takes `setScreen` from the names in the code too, since `6b2dbd238`'s
+  successor. Tifa and Kasumi name their main menu `main_menu`, which core lists first since
+  then; their `end` clips aren't listed.
 - **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
   supporting.
 
