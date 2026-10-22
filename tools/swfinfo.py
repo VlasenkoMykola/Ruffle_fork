@@ -2,9 +2,9 @@
 """Summarizes how SWF files are structured and how they load each other.
 
 Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folder> ...]
-       python swfinfo.py --classify <folder> [<folder> ...]
-       python swfinfo.py --unsupported <folder> [<folder> ...]
-       python swfinfo.py --unsupported-names <folder> [<folder> ...]
+       python swfinfo.py --classify [--onefolderdeep] <folder> [<folder> ...]
+       python swfinfo.py --unsupported [--onefolderdeep] <folder> [<folder> ...]
+       python swfinfo.py --unsupported-names [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --scenes <file> [<file> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
@@ -25,7 +25,10 @@ labels only, or in a way it doesn't know yet. SWFs in a subfolder that a game
 names, like parts/, or named by another SWF next to them, are taken for parts of
 that game. --unsupported does the same, but leaves the supported games out of the
 list (they're still counted). --unsupported-names prints only the paths of the games
-that aren't supported, one per line, to run this script on one at a time.
+that aren't supported, one per line, to run this script on one at a time. With
+--onefolderdeep, these only look at the SWFs in the given folders and in their direct
+subfolders, like one folder per game, and leave out SWFs further down, like those
+bundled in HTML games.
 
 --scenes lists the scenes of games that keep their own list of them, with what the
 movie has under each name: the movie clip the game shows for it, its labels, and
@@ -1332,15 +1335,19 @@ def launcher_method(path, movie):
     return None
 
 
-def classify(args, unsupported_only=False, names_only=False):
+def classify(args, unsupported_only=False, names_only=False, max_depth=None):
     """Prints how each game in the given folders handles its scenes, and a tally. With
     `unsupported_only`, the supported games are left out of the list. With `names_only`,
-    it prints only the paths of the games that aren't supported."""
+    it prints only the paths of the games that aren't supported. With `max_depth`, only
+    the SWFs that many folders down or less are looked at (1 for direct subfolders)."""
     by_folder = {}  # Folder -> (folder to show it relative to, SWFs in it)
     for arg in args:
         base = os.path.dirname(os.path.abspath(arg))
         if os.path.isdir(arg):
             for root, dirs, names in os.walk(arg):
+                depth = len(os.path.relpath(root, arg).split(os.sep)) if root != arg else 0
+                if max_depth is not None and depth >= max_depth:
+                    dirs.clear()
                 dirs.sort()
                 swfs = [os.path.join(root, name) for name in sorted(names)
                         if name.lower().endswith(".swf")]
@@ -1428,9 +1435,11 @@ def classify(args, unsupported_only=False, names_only=False):
 def main(args):
     dump = "main" if "--dump-main" in args else "all" if "--dump" in args else None
     names_only = "--unsupported-names" in args
+    max_depth = 1 if "--onefolderdeep" in args else None
     unsupported_only = "--unsupported" in args or names_only
     classifying, scenes = "--classify" in args or unsupported_only, "--scenes" in args
-    modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes")
+    modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes",
+             "--onefolderdeep")
     unknown_modes = [arg for arg in args if arg.startswith("--") and arg not in modes]
     if unknown_modes:  # It would be taken for a file name, and everything else described
         print(f"Unknown option {unknown_modes[0]}; this version has: {', '.join(modes)}")
@@ -1449,7 +1458,7 @@ def main(args):
     except AttributeError:
         pass
     if classifying:
-        return classify(args, unsupported_only, names_only)
+        return classify(args, unsupported_only, names_only, max_depth)
     if scenes:
         for path in args:
             try:

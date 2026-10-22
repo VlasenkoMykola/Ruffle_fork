@@ -233,6 +233,9 @@ output they paste back, since the games themselves aren't shared:
   read by the script's `frame_jumps` the same way, which the user doesn't count as
   supported; `--scenes` lists their frames. SWFs in a subfolder that a game names
   (like `parts/`), or named by another SWF next to them, count as its parts.
+- `--onefolderdeep` (with `--classify`, `--unsupported`, `--unsupported-names`): only the
+  SWFs in the given folders and their direct subfolders count as games, leaving out SWFs
+  bundled deeper in HTML games; launchers' parts are still read from their `parts` folders.
 - `--unsupported <folders>`: the same, listing only the games that aren't supported (the
   tally still counts all of them), to find the next samples. `--unsupported-names
   <folders>`: only the paths of those games, one per line.
