@@ -199,7 +199,7 @@ Other games:
   `Array_indexOf` only finds anything when `_url.substring(2, 4) == "le"` (a `file://`
   URL). Core lists the scenes the parts reported (sorted by number when all have one),
   takes the current one from `cur_file.clip.screen_name`, and switches with
-  `srv_send_screen(name)`; untested by the user so far.
+  `srv_send_screen(name)`, which works in all four (tested on Android `17eb663`).
 - **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
   supporting.
 
@@ -228,8 +228,10 @@ Giant 3's version (`6b2dbd238`), 350 supported and 66 unknown, of which the user
 10 to 20 as real games, the rest being SWFs bundled in HTML games. Counting games only
 (`--onefolderdeep`, `122dc6237`): 353 games, 325 supported, 7 frame labels only, 7 only
 frame jumps supported, 14 unknown; with `setScreen` found by name in protected games
-(`467e51a2a`), 332 supported and 7 unknown. The user sends samples of the unknown ones
-first.
+(`467e51a2a`), 332 supported and 7 unknown; with launchers judged by their parts and
+Metropolis Files' version (`92c11d307`), 338 supported, 7 frame labels only, 7 only frame
+jumps supported and 1 unknown (boundary expansion lab, which doesn't run in Ruffle): every
+game of the collection that runs in Ruffle is supported.
 
 ## Frontends
 
