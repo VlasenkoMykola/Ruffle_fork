@@ -202,8 +202,9 @@ the user removed duplicate files: 436 games, 343 supported, 7 frame labels only,
 (with `screen_N` clips, `dbde61b34`), and then, with frame jumps (`8c99a6b68`), 343
 supported, 7 frame labels only, 13 only frame jumps supported and 73 unknown; with The Iron
 Giant 3's version (`6b2dbd238`), 350 supported and 66 unknown, of which the user counts only
-10 to 20 as real games, the rest being SWFs bundled in HTML games. The user sends samples of
-the unknown ones first.
+10 to 20 as real games, the rest being SWFs bundled in HTML games. Counting games only
+(`--onefolderdeep`, `122dc6237`): 353 games, 325 supported, 7 frame labels only, 7 only
+frame jumps supported, 14 unknown. The user sends samples of the unknown ones first.
 
 ## Frontends
 
