@@ -172,8 +172,8 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
 - **The Iron Giant 3** and **Super Family 2**: launchers like Olympic Contest's (`LoadGame`,
   `gameLoader`, `qfile` = `parts/irong3`, `setScreen` and `gotoScreen` in the launcher),
   with Evil Sorceress's list names `screens_list` and `screens_arr`. The menu works in them
-  (tested); `--classify` counts them since `8c99a6b68`'s successor that names its list
-  variables `SCENE_LISTS`, as core's.
+  (tested); `--classify` counts them since `6b2dbd238`, which gave it core's list variables
+  (`SCENE_LISTS`).
 
 Other games:
 
