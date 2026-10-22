@@ -211,7 +211,9 @@ supported, 7 frame labels only, 13 only frame jumps supported and 73 unknown; wi
 Giant 3's version (`6b2dbd238`), 350 supported and 66 unknown, of which the user counts only
 10 to 20 as real games, the rest being SWFs bundled in HTML games. Counting games only
 (`--onefolderdeep`, `122dc6237`): 353 games, 325 supported, 7 frame labels only, 7 only
-frame jumps supported, 14 unknown. The user sends samples of the unknown ones first.
+frame jumps supported, 14 unknown; with `setScreen` found by name in protected games
+(`467e51a2a`), 332 supported and 7 unknown. The user sends samples of the unknown ones
+first.
 
 ## Frontends
 
