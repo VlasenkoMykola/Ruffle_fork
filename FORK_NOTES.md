@@ -169,7 +169,16 @@ Unknown to `--classify`, but of the same developer (samples sent so far):
 - **Avatar The Last Airbender** and **Baka 1**: the version without a list (0 above), which
   the menu supports since it lists the exported scene clips.
 
+- **The Iron Giant 3** and **Super Family 2**: launchers like Olympic Contest's (`LoadGame`,
+  `gameLoader`, `qfile` = `parts/irong3`, `setScreen` and `gotoScreen` in the launcher),
+  with Evil Sorceress's list names `screens_list` and `screens_arr`. The menu works in them
+  (tested); `--classify` counts them since `8c99a6b68`'s successor that names its list
+  variables `SCENE_LISTS`, as core's.
+
 Other games:
+
+- **boundary expansion lab** (AS3, `loadBytes`): doesn't run in Ruffle at all, so not worth
+  supporting.
 
 - **Digital Adventure** (another developer, AS3): its scenes look like SWFs embedded in the
   main one (`Main_s0_class`...`Main_s8_class`, from `s0.swf`...`s8.swf`), loaded by a `Main`

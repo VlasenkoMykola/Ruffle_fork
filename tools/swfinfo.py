@@ -1116,14 +1116,20 @@ def describe(path, display_name, other_names, dump, data=None):
         describe(None, f"{display_name} > embedded {name}", other_names, dump, data=body[start:end])
 
 
+# The variables the versions of the engine keep their scene lists in, as Ruffle's core
+# looks for them (on the root timeline or in _global).
+SCENE_LISTS = ("Qvar", "scenelist", "screens", "screens_list")
 # The versions of the engine whose own scene lists Ruffle's scene menu reads, by a
-# variable that only that version has, newest first. All of them keep the list in
-# `Qvar` or `scenelist`, and switch scenes with a `setScreen` function.
+# variable that only that version has, newest first. All of them keep the list in one of
+# SCENE_LISTS, and switch scenes with a `setScreen` function.
 ENGINE_VERSIONS = [
     ("Qmod", "Hitomi's"),
     ("Qfrm", "Mortal Combat's"),
     ("Qvar", "NC2's"),
     ("scenelist", "Olympic Contest's"),
+    # Launchers with setScreen and a list with the names Evil Sorceress keeps in _global
+    ("screens_list", "The Iron Giant 3's"),
+    ("screens", "The Iron Giant 3's"),
 ]
 # The lists of scenes that launchers which load their parts over themselves keep in
 # _global, with the parts' setScreen switching scenes, by the version of the engine.
@@ -1136,7 +1142,7 @@ STATUSES = (SUPPORTED, LABELS_ONLY, JUMPS_ONLY, UNKNOWN, UNREADABLE)
 def game_scene_list(movie):
     """(where the code keeps it, names) of a game's own scene list, if the code has it."""
     for name, values in movie.main.arrays:
-        if name in ("Qvar", "scenelist", *LAUNCHER_LISTS):
+        if name in SCENE_LISTS:
             return f"an array in {name}, in the code of the main timeline", values
     for name, values in movie.nested.arrays:
         if name in ("Qvar", "scenelist"):
@@ -1202,7 +1208,7 @@ def frame_jumps(movie):
 def scene_method(movie):
     """How a movie handles its scenes, as (status, description)."""
     strings = set(movie.main.strings)
-    if "setScreen" in movie.main.functions and strings & {"Qvar", "scenelist"}:
+    if "setScreen" in movie.main.functions and strings & set(SCENE_LISTS):
         version = next(version for variable, version in ENGINE_VERSIONS if variable in strings)
         count = scene_count(movie)
         details = f", {count} scenes" if count else ""
