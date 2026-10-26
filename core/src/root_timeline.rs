@@ -10,8 +10,8 @@ use crate::display_object::{DisplayObject, MovieClip, TDisplayObject, TDisplayOb
 use crate::prelude::CharacterId;
 use crate::string::{AvmString, WStr};
 use crate::tag_utils::SwfMovieData;
-use std::collections::HashSet;
-use swf::avm1::types::{Action, Value as Avm1Value};
+use std::collections::{HashMap, HashSet};
+use swf::avm1::types::{Action, FunctionFlags, Value as Avm1Value};
 use swf::{SwfStr, Tag, TagCode};
 
 /// The variables in which games made with a certain engine keep their own list of
@@ -469,20 +469,39 @@ fn scene_clips<'gc>(
 /// `tellTarget("_root")`) anywhere. Unreadable code is skipped.
 fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
     let mut jumps = Vec::new();
-    let mut buttons = Vec::new();
-    let mut placed_on_root = HashSet::new();
-    // Code whose own target is a movie clip, which only jumps the root explicitly.
-    let mut clip_code = Vec::new();
-    fn add_clip_actions<'a>(place_object: &swf::PlaceObject<'a>, code: &mut Vec<&'a [u8]>) {
+    for (code, on_root) in code_blocks(data, version) {
+        scan_jumps(code, version, on_root, &mut jumps);
+    }
+    jumps
+}
+
+/// The blocks of AVM1 code in the tag stream `data` of a movie, in the order they come
+/// in, each with whether its own target is the root timeline: the code of the root
+/// timeline's frames and of the buttons placed on it. The others' are movie clips: the
+/// code of their frames, their `onClipEvent` handlers and `#initclip` code, and the
+/// buttons placed in them. Unreadable tags are skipped.
+fn code_blocks(data: &[u8], version: u8) -> Vec<(&[u8], bool)> {
+    /// Whose code a block is.
+    enum Owner {
+        Root,
+        Clip,
+        Button(CharacterId),
+    }
+    fn add_clip_actions<'a>(
+        place_object: &swf::PlaceObject<'a>,
+        blocks: &mut Vec<(&'a [u8], Owner)>,
+    ) {
         for clip_action in place_object
             .clip_actions
             .iter()
             .flat_map(|actions| &actions.records)
         {
-            code.push(clip_action.action_data);
+            blocks.push((clip_action.action_data, Owner::Clip));
         }
     }
 
+    let mut blocks = Vec::new();
+    let mut placed_on_root = HashSet::new();
     let mut reader = swf::read::Reader::new(data, version);
     while let Ok((tag_code, length)) = reader.read_tag_code_and_length() {
         let rest = reader.get_ref();
@@ -493,10 +512,22 @@ fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
         let mut tag = swf::read::Reader::new(body, version);
         match TagCode::from_u16(tag_code) {
             Some(TagCode::End) => break,
-            Some(TagCode::DoAction) => scan_jumps(body, version, true, &mut jumps),
-            Some(TagCode::DoInitAction) => clip_code.extend(body.get(2..)),
-            Some(TagCode::DefineButton) => buttons.extend(tag.read_define_button_1().ok()),
-            Some(TagCode::DefineButton2) => buttons.extend(tag.read_define_button_2().ok()),
+            Some(TagCode::DoAction) => blocks.push((body, Owner::Root)),
+            Some(TagCode::DoInitAction) => {
+                blocks.extend(body.get(2..).map(|code| (code, Owner::Clip)));
+            }
+            Some(code @ (TagCode::DefineButton | TagCode::DefineButton2)) => {
+                let button = if code == TagCode::DefineButton {
+                    tag.read_define_button_1()
+                } else {
+                    tag.read_define_button_2()
+                };
+                if let Ok(button) = button {
+                    for action in &button.actions {
+                        blocks.push((action.action_data, Owner::Button(button.id)));
+                    }
+                }
+            }
             Some(code @ (TagCode::PlaceObject | TagCode::PlaceObject2 | TagCode::PlaceObject3)) => {
                 let place_object = match code {
                     TagCode::PlaceObject => tag.read_place_object(),
@@ -509,7 +540,7 @@ fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
                     {
                         placed_on_root.insert(id);
                     }
-                    add_clip_actions(&place_object, &mut clip_code);
+                    add_clip_actions(&place_object, &mut blocks);
                 }
             }
             Some(TagCode::DefineSprite) => {
@@ -519,9 +550,9 @@ fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
                     .unwrap_or_default()
                 {
                     match sprite_tag {
-                        Tag::DoAction(code) => clip_code.push(code),
+                        Tag::DoAction(code) => blocks.push((code, Owner::Clip)),
                         Tag::PlaceObject(place_object) => {
-                            add_clip_actions(&place_object, &mut clip_code)
+                            add_clip_actions(&place_object, &mut blocks)
                         }
                         _ => {}
                     }
@@ -530,17 +561,17 @@ fn frame_jumps(data: &[u8], version: u8) -> Vec<u16> {
             _ => {}
         }
     }
-
-    for button in &buttons {
-        let on_root = placed_on_root.contains(&button.id);
-        for action in &button.actions {
-            scan_jumps(action.action_data, version, on_root, &mut jumps);
-        }
-    }
-    for code in clip_code {
-        scan_jumps(code, version, false, &mut jumps);
-    }
-    jumps
+    blocks
+        .into_iter()
+        .map(|(code, owner)| {
+            let on_root = match owner {
+                Owner::Root => true,
+                Owner::Clip => false,
+                Owner::Button(id) => placed_on_root.contains(&id),
+            };
+            (code, on_root)
+        })
+        .collect()
 }
 
 /// Adds the frames that the AVM1 `code` jumps the root timeline to to `jumps`, where
@@ -652,6 +683,486 @@ fn scan_jumps(code: &[u8], version: u8, on_root: bool, jumps: &mut Vec<u16>) {
             _ => stack.clear(),
         }
     }
+}
+
+/// Where a [`FrameVariable`] lives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Home {
+    /// The root timeline
+    Root,
+    /// `_global`
+    Global,
+}
+
+/// A variable that the code of a movie picks the frame of a timeline with, like the
+/// version of a character, picked earlier in the game, in `gotoAndStop(_root.version)`.
+/// A scene opened from the scene menu skips the code that gives it a value, which leaves
+/// such clips playing through all their versions, so the menu gives it the first constant
+/// that the movie's code gives a variable of its name, or else 1, the first frame.
+#[derive(Clone, Debug, PartialEq)]
+struct FrameVariable {
+    home: Home,
+    name: String,
+    value: Constant,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Constant {
+    Number(f64),
+    String(String),
+}
+
+/// The timeline that code scanned for [`FrameVariable`]s works on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Target {
+    Root,
+    /// A movie clip, whose variables can't be given values before it's there
+    Clip,
+    /// One that a path names, or that isn't known
+    Other,
+}
+
+/// A value on the stack of code scanned for [`FrameVariable`]s, as far as it's followed.
+#[derive(Clone, Debug)]
+enum Item {
+    Constant(Constant),
+    /// A timeline whose variables can be [`FrameVariable`]s
+    Timeline(Home),
+    /// A value worked out from these variables
+    Reads(Vec<(Home, String)>),
+    Other,
+}
+
+impl Item {
+    fn reads(self) -> Vec<(Home, String)> {
+        match self {
+            Item::Reads(reads) => reads,
+            _ => Vec::new(),
+        }
+    }
+
+    /// A value worked out from `items`.
+    fn from(items: Vec<Item>) -> Item {
+        let reads: Vec<_> = items.into_iter().flat_map(Item::reads).collect();
+        if reads.is_empty() {
+            Item::Other
+        } else {
+            Item::Reads(reads)
+        }
+    }
+}
+
+/// What the code of a movie does with the variables that can be [`FrameVariable`]s.
+#[derive(Default)]
+struct VariableUses {
+    /// The variables read to work out the frames that the code goes to
+    picks: Vec<(Home, String)>,
+    /// The constants that the code gives variables, by name, in the order of the code
+    constants: Vec<(String, Constant)>,
+}
+
+/// The [`FrameVariable`]s of the movie whose tag stream is `data`.
+fn frame_variables(data: &[u8], version: u8) -> Vec<FrameVariable> {
+    let mut uses = VariableUses::default();
+    for (code, on_root) in code_blocks(data, version) {
+        let target = if on_root { Target::Root } else { Target::Clip };
+        scan_variables(code, version, target, false, HashMap::new(), &mut uses);
+    }
+    let mut variables: Vec<FrameVariable> = Vec::new();
+    for (home, name) in uses.picks {
+        // Names starting with _ are properties, like _currentframe.
+        let known = variables
+            .iter()
+            .any(|known| known.home == home && known.name.eq_ignore_ascii_case(&name));
+        if name.starts_with('_') || known {
+            continue;
+        }
+        let value = uses
+            .constants
+            .iter()
+            .find(|(set, _)| set.eq_ignore_ascii_case(&name))
+            .map_or(Constant::Number(1.0), |(_, value)| value.clone());
+        variables.push(FrameVariable { home, name, value });
+    }
+    variables
+}
+
+/// Where a variable that code working on `target` reads by its name alone lives, if it can
+/// be a [`FrameVariable`]: a movie clip that doesn't have it reads `_global`'s, from SWF 6.
+fn own_home(target: Target, version: u8) -> Option<Home> {
+    match target {
+        Target::Root => Some(Home::Root),
+        Target::Clip if version >= 6 => Some(Home::Global),
+        _ => None,
+    }
+}
+
+/// The timeline named by `path`, like `_root`, `/` or `_global`, in code working on
+/// `target`, if its variables can be [`FrameVariable`]s.
+fn timeline_home(path: &str, target: Target) -> Option<Home> {
+    let path = path.trim_end_matches(['/', ':']);
+    let is = |name: &str| path.eq_ignore_ascii_case(name);
+    if path.is_empty() || is("_root") || is("_level0") {
+        Some(Home::Root)
+    } else if is("_global") {
+        Some(Home::Global)
+    } else if (is("_parent") && target == Target::Clip) || (is("this") && target == Target::Root) {
+        // Movie clips are mostly placed on the root timeline.
+        Some(Home::Root)
+    } else {
+        None
+    }
+}
+
+/// Where the variable named by `path`, like `version`, `_root.version` or `/:version`,
+/// lives, and its name, in code working on `target`, if it can be a [`FrameVariable`].
+fn variable_home(path: &str, target: Target, version: u8) -> Option<(Home, &str)> {
+    match path.rfind(['.', ':', '/']) {
+        None => Some((own_home(target, version)?, path)),
+        Some(end) => {
+            let name = &path[end + 1..];
+            let home = timeline_home(&path[..end], target)?;
+            (!name.is_empty()).then_some((home, name))
+        }
+    }
+}
+
+/// Adds what the AVM1 `code`, which works on `own`, does with variables that can be
+/// [`FrameVariable`]s to `uses`, where `in_function` is whether it's the body of a
+/// function, whose local variables aren't the game's, and `registers` what its registers
+/// start with.
+fn scan_variables(
+    code: &[u8],
+    version: u8,
+    own: Target,
+    in_function: bool,
+    mut registers: HashMap<u8, Item>,
+    uses: &mut VariableUses,
+) {
+    let encoding = SwfStr::encoding_for_version(version);
+    let constant =
+        |string: &SwfStr| Item::Constant(Constant::String(string.to_string_lossy(encoding)));
+    let pop = |stack: &mut Vec<Item>| stack.pop().unwrap_or(Item::Other);
+    // The number of arguments, or items, that an action pops, if it's known
+    let pop_count = |stack: &mut Vec<Item>| match stack.pop() {
+        Some(Item::Constant(Constant::Number(count))) if (0.0..=256.0).contains(&count) => {
+            Some(count as usize)
+        }
+        _ => None,
+    };
+    let is_goto = |name: &Item| {
+        matches!(name, Item::Constant(Constant::String(name))
+            if name.eq_ignore_ascii_case("gotoAndStop") || name.eq_ignore_ascii_case("gotoAndPlay"))
+    };
+
+    let mut reader = swf::avm1::read::Reader::new(code, version);
+    let mut constants: Vec<&SwfStr> = Vec::new();
+    let mut stack: Vec<Item> = Vec::new();
+    let mut target = own;
+    while let Ok(action) = reader.read_action() {
+        match action {
+            Action::End => break,
+            Action::ConstantPool(pool) => constants = pool.strings,
+            Action::Push(push) => {
+                for value in &push.values {
+                    stack.push(match value {
+                        Avm1Value::Int(number) => {
+                            Item::Constant(Constant::Number(f64::from(*number)))
+                        }
+                        Avm1Value::Float(number) => {
+                            Item::Constant(Constant::Number(f64::from(*number)))
+                        }
+                        Avm1Value::Double(number) => Item::Constant(Constant::Number(*number)),
+                        Avm1Value::Str(string) => constant(string),
+                        Avm1Value::ConstantPool(index) => constants
+                            .get(usize::from(*index))
+                            .map_or(Item::Other, |string| constant(string)),
+                        Avm1Value::Register(register) => {
+                            registers.get(register).cloned().unwrap_or(Item::Other)
+                        }
+                        _ => Item::Other,
+                    });
+                }
+            }
+            Action::GetVariable => {
+                let item = match pop(&mut stack) {
+                    Item::Constant(Constant::String(path)) => {
+                        match (
+                            timeline_home(&path, target),
+                            variable_home(&path, target, version),
+                        ) {
+                            (Some(home), _) if !path.is_empty() => Item::Timeline(home),
+                            (_, Some((home, name))) => Item::Reads(vec![(home, name.to_owned())]),
+                            _ => Item::Other,
+                        }
+                    }
+                    _ => Item::Other,
+                };
+                stack.push(item);
+            }
+            Action::GetMember => {
+                let member = pop(&mut stack);
+                let object = pop(&mut stack);
+                stack.push(match (object, member) {
+                    (Item::Timeline(home), Item::Constant(Constant::String(name))) => {
+                        Item::Reads(vec![(home, name)])
+                    }
+                    _ => Item::Other,
+                });
+            }
+            Action::SetVariable => {
+                let value = pop(&mut stack);
+                let path = pop(&mut stack);
+                if let (Item::Constant(value), Item::Constant(Constant::String(path))) =
+                    (value, path)
+                {
+                    let name = path.rsplit(['.', ':', '/']).next().unwrap_or_default();
+                    uses.constants.push((name.to_owned(), value));
+                }
+            }
+            Action::SetMember => {
+                let value = pop(&mut stack);
+                let name = pop(&mut stack);
+                pop(&mut stack);
+                if let (Item::Constant(value), Item::Constant(Constant::String(name))) =
+                    (value, name)
+                {
+                    uses.constants.push((name, value));
+                }
+            }
+            Action::DefineLocal => {
+                let value = pop(&mut stack);
+                let name = pop(&mut stack);
+                if let (false, Item::Constant(value), Item::Constant(Constant::String(name))) =
+                    (in_function, value, name)
+                {
+                    uses.constants.push((name, value));
+                }
+            }
+            Action::DefineLocal2 | Action::Pop | Action::If(_) | Action::Trace => {
+                pop(&mut stack);
+            }
+            Action::StoreRegister(store) => {
+                if let Some(top) = stack.last() {
+                    registers.insert(store.register, top.clone());
+                }
+            }
+            Action::PushDuplicate => {
+                let top = stack.last().cloned().unwrap_or(Item::Other);
+                stack.push(top);
+            }
+            Action::StackSwap => {
+                let top = pop(&mut stack);
+                let below = pop(&mut stack);
+                stack.extend([top, below]);
+            }
+            Action::Add
+            | Action::Add2
+            | Action::Subtract
+            | Action::Multiply
+            | Action::Divide
+            | Action::Modulo
+            | Action::StringAdd
+            | Action::Equals
+            | Action::Equals2
+            | Action::StrictEquals
+            | Action::Less
+            | Action::Less2
+            | Action::Greater
+            | Action::StringEquals
+            | Action::StringLess
+            | Action::StringGreater
+            | Action::And
+            | Action::Or
+            | Action::BitAnd
+            | Action::BitOr
+            | Action::BitXor
+            | Action::BitLShift
+            | Action::BitRShift
+            | Action::BitURShift => {
+                let right = pop(&mut stack);
+                let left = pop(&mut stack);
+                stack.push(Item::from(vec![left, right]));
+            }
+            Action::Not
+            | Action::ToInteger
+            | Action::ToNumber
+            | Action::ToString
+            | Action::Increment
+            | Action::Decrement
+            | Action::StringLength
+            | Action::MBStringLength
+            | Action::CharToAscii
+            | Action::AsciiToChar
+            | Action::MBCharToAscii
+            | Action::MBAsciiToChar
+            | Action::TypeOf
+            | Action::RandomNumber => {
+                let value = pop(&mut stack);
+                stack.push(Item::from(vec![value]));
+            }
+            Action::GotoFrame2(_) => {
+                let frame = pop(&mut stack);
+                uses.picks.extend(frame.reads());
+            }
+            Action::CallFunction | Action::CallMethod | Action::NewObject | Action::NewMethod => {
+                let is_call = matches!(action, Action::CallFunction | Action::CallMethod);
+                let name = pop(&mut stack);
+                if matches!(action, Action::CallMethod | Action::NewMethod) {
+                    pop(&mut stack);
+                }
+                let Some(count) = pop_count(&mut stack) else {
+                    stack.clear();
+                    continue;
+                };
+                let mut args: Vec<Item> = (0..count).map(|_| pop(&mut stack)).collect();
+                if is_call && is_goto(&name) && !args.is_empty() {
+                    uses.picks.extend(args.swap_remove(0).reads());
+                }
+                stack.push(Item::Other);
+            }
+            Action::InitArray | Action::InitObject => {
+                let per_item = if matches!(action, Action::InitObject) {
+                    2
+                } else {
+                    1
+                };
+                let Some(count) = pop_count(&mut stack) else {
+                    stack.clear();
+                    continue;
+                };
+                for _ in 0..count * per_item {
+                    pop(&mut stack);
+                }
+                stack.push(Item::Other);
+            }
+            Action::Stop
+            | Action::Play
+            | Action::NextFrame
+            | Action::PreviousFrame
+            | Action::Jump(_)
+            | Action::GotoFrame(_)
+            | Action::GotoLabel(_)
+            | Action::StopSounds
+            | Action::ToggleQuality
+            | Action::EndDrag => {}
+            Action::SetTarget(set_target) => {
+                let path = set_target.target.to_string_lossy(encoding);
+                target = if path.is_empty() {
+                    own
+                } else if timeline_home(&path, own) == Some(Home::Root) {
+                    Target::Root
+                } else {
+                    Target::Other
+                };
+            }
+            Action::SetTarget2 => {
+                pop(&mut stack);
+                target = Target::Other;
+            }
+            Action::DefineFunction(function) => {
+                scan_variables(
+                    function.actions,
+                    version,
+                    target,
+                    true,
+                    HashMap::new(),
+                    uses,
+                );
+                if function.name.is_empty() {
+                    stack.push(Item::Other);
+                }
+            }
+            Action::DefineFunction2(function) => {
+                // The values that a function preloads go in its registers from 1, in this order.
+                let timeline =
+                    |path| timeline_home(path, target).map_or(Item::Other, Item::Timeline);
+                let preloaded = [
+                    (FunctionFlags::PRELOAD_THIS, timeline("this")),
+                    (FunctionFlags::PRELOAD_ARGUMENTS, Item::Other),
+                    (FunctionFlags::PRELOAD_SUPER, Item::Other),
+                    (FunctionFlags::PRELOAD_ROOT, Item::Timeline(Home::Root)),
+                    (FunctionFlags::PRELOAD_PARENT, timeline("_parent")),
+                    (FunctionFlags::PRELOAD_GLOBAL, Item::Timeline(Home::Global)),
+                ];
+                let function_registers = preloaded
+                    .into_iter()
+                    .filter(|(flag, _)| function.flags.contains(*flag))
+                    .zip(1..)
+                    .map(|((_, item), register)| (register, item))
+                    .collect();
+                scan_variables(
+                    function.actions,
+                    version,
+                    target,
+                    true,
+                    function_registers,
+                    uses,
+                );
+                if function.name.is_empty() {
+                    stack.push(Item::Other);
+                }
+            }
+            Action::With(with) => {
+                pop(&mut stack);
+                scan_variables(
+                    with.actions,
+                    version,
+                    Target::Other,
+                    in_function,
+                    registers.clone(),
+                    uses,
+                );
+            }
+            Action::Try(try_block) => {
+                for body in [
+                    Some(try_block.try_body),
+                    try_block.catch_body.map(|(_, body)| body),
+                ]
+                .into_iter()
+                .chain([try_block.finally_body])
+                .flatten()
+                {
+                    scan_variables(body, version, target, in_function, registers.clone(), uses);
+                }
+            }
+            _ => stack.clear(),
+        }
+    }
+}
+
+/// Gives the [`FrameVariable`]s of the movie of the root timeline `root` that have no
+/// value their value, before the scene menu jumps over the code that would.
+pub(crate) fn fill_frame_variables<'gc>(
+    context: &mut UpdateContext<'gc>,
+    root: DisplayObject<'gc>,
+) {
+    let Some(object) = root.object1() else {
+        return;
+    };
+    let movie = root.movie();
+    let variables = frame_variables(movie.data(), movie.version());
+    if variables.is_empty() {
+        return;
+    }
+    Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
+        for variable in variables {
+            let home = match variable.home {
+                Home::Root => object,
+                Home::Global => activation.global_object(),
+            };
+            if !matches!(stored(home, &variable.name, activation), Value::Undefined) {
+                continue;
+            }
+            let name = AvmString::new_utf8(activation.gc(), &variable.name);
+            let value = match variable.value {
+                Constant::Number(number) => Value::Number(number),
+                Constant::String(string) => AvmString::new_utf8(activation.gc(), string).into(),
+            };
+            // A setter of the game's that fails leaves the variable as it is.
+            let _ = home.set(name, value, activation);
+        }
+    });
 }
 
 impl RootTimeline {
@@ -1233,6 +1744,193 @@ mod tests {
         player.goto_and_play_root_frame(next.start);
         let timeline = player.root_timeline().unwrap();
         assert_eq!(timeline.current_scene(), Some(1));
+    }
+
+    /// A movie whose clips show the version of a character that a button picks on frame 1,
+    /// the ways games do: on frame 2, `hero` shows `_root.char`, which frame 1 sets, `hat`
+    /// shows `hat_version`, which only the button sets (in `_global`), and `shirt` shows
+    /// `_root.outfit`, which only a function sets, to what it's given.
+    fn game_with_versions() -> Vec<u8> {
+        use swf::avm1::types::{GotoFrame2, StoreRegister};
+        use swf::{
+            Button, ButtonAction, ButtonActionCondition, PlaceObject, PlaceObjectAction, Sprite,
+            Tag,
+        };
+
+        let show = |variable: &[Action<'static>]| {
+            let mut code = actions(variable);
+            code.extend(actions(&[Action::GotoFrame2(GotoFrame2 {
+                set_playing: false,
+                scene_offset: 0,
+            })]));
+            code.push(0);
+            code
+        };
+        let root_member = |name: &'static str| {
+            vec![
+                push(&[string("_root")]),
+                Action::GetVariable,
+                push(&[string(name)]),
+                Action::GetMember,
+            ]
+        };
+        // gotoAndStop(_root.char), gotoAndStop(hat_version), gotoAndStop(_root.outfit)
+        let hero = show(&root_member("char"));
+        let hat = show(&[push(&[string("hat_version")]), Action::GetVariable]);
+        let shirt = show(&root_member("outfit"));
+        // on (release) { _root.char = 2; _global.hat_version = 3; gotoAndPlay(2); }
+        let mut button_code = actions(&[
+            push(&[string("_root")]),
+            Action::GetVariable,
+            push(&[string("char"), Value::Int(2)]),
+            Action::SetMember,
+            push(&[string("_global")]),
+            Action::GetVariable,
+            push(&[string("hat_version"), Value::Int(3)]),
+            Action::SetMember,
+            Action::Play,
+        ]);
+        button_code.push(0);
+        // function pick(n) { _root.outfit = n; } char = 3; stop();
+        let pick = actions(&[
+            push(&[string("_root")]),
+            Action::GetVariable,
+            push(&[string("outfit"), string("n")]),
+            Action::GetVariable,
+            Action::StoreRegister(StoreRegister { register: 1 }),
+            Action::SetMember,
+        ]);
+        let mut frame_1 = actions(&[
+            Action::DefineFunction(DefineFunction {
+                name: "pick".into(),
+                params: vec!["n".into()],
+                actions: &pick,
+            }),
+            push(&[string("char"), Value::Int(3)]),
+            Action::SetVariable,
+            Action::Stop,
+        ]);
+        frame_1.push(0);
+        let mut frame_2 = actions(&[Action::Stop]);
+        frame_2.push(0);
+
+        let place = |id, depth, name: Option<&'static str>| {
+            Tag::PlaceObject(Box::new(PlaceObject {
+                version: 2,
+                action: PlaceObjectAction::Place(id),
+                depth,
+                matrix: None,
+                color_transform: None,
+                ratio: None,
+                name: name.map(Into::into),
+                clip_depth: None,
+                class_name: None,
+                filters: None,
+                background_color: None,
+                blend_mode: None,
+                clip_actions: None,
+                has_image: false,
+                is_bitmap_cached: None,
+                is_visible: None,
+                amf_data: None,
+            }))
+        };
+        let sprite = |id, code| {
+            Tag::DefineSprite(Sprite {
+                id,
+                num_frames: 3,
+                tags: vec![
+                    Tag::DoAction(code),
+                    Tag::ShowFrame,
+                    Tag::ShowFrame,
+                    Tag::ShowFrame,
+                ],
+            })
+        };
+        let tags = vec![
+            sprite(1, &hero),
+            sprite(2, &hat),
+            sprite(3, &shirt),
+            Tag::DefineButton2(Box::new(Button {
+                id: 4,
+                is_track_as_menu: false,
+                records: vec![],
+                actions: vec![ButtonAction {
+                    conditions: ButtonActionCondition::OVER_DOWN_TO_OVER_UP,
+                    action_data: &button_code,
+                }],
+            })),
+            place(4, 1, None),
+            Tag::DoAction(&frame_1),
+            Tag::ShowFrame,
+            place(1, 2, Some("hero")),
+            place(2, 3, Some("hat")),
+            place(3, 4, Some("shirt")),
+            Tag::DoAction(&frame_2),
+            Tag::ShowFrame,
+        ];
+        let header = swf::Header {
+            num_frames: 2,
+            ..swf::Header::default_with_swf_version(8)
+        };
+        let mut data = Vec::new();
+        swf::write_swf(&header, &tags, &mut data).unwrap();
+        data
+    }
+
+    /// The frame that the movie clip named `name` on the root timeline is on.
+    fn clip_frame(player: &mut Player, name: &str) -> Option<u16> {
+        use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
+        player.mutate_with_update_context(|context| {
+            let root = context.stage.root_clip()?.as_container()?;
+            let clip =
+                root.child_by_name(crate::string::WStr::from_units(name.as_bytes()), false)?;
+            Some(clip.as_movie_clip()?.current_frame())
+        })
+    }
+
+    #[test]
+    fn find_frame_variables() {
+        use super::{Constant, FrameVariable, Home, frame_variables};
+        let variable = |home, name: &str, value| FrameVariable {
+            home,
+            name: name.to_owned(),
+            value: Constant::Number(value),
+        };
+        assert_eq!(
+            frame_variables(
+                &swf::decompress_swf(&game_with_versions()[..]).unwrap().data,
+                8
+            ),
+            [
+                variable(Home::Root, "char", 2.0),
+                variable(Home::Global, "hat_version", 3.0),
+                variable(Home::Root, "outfit", 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_frame_variables_when_jumping() {
+        let player = load_swf(&game_with_versions());
+        let mut player = player.lock().unwrap();
+
+        player.goto_and_play_root_frame(2);
+        player.run_frame();
+        player.run_frame();
+        // The value that frame 1 gave char is kept, and the others get one.
+        assert_eq!(clip_frame(&mut player, "hero"), Some(3));
+        assert_eq!(clip_frame(&mut player, "hat"), Some(3));
+        assert_eq!(clip_frame(&mut player, "shirt"), Some(1));
+        // And they stay there.
+        player.run_frame();
+        for (clip, frame) in [("hero", 3), ("hat", 3), ("shirt", 1)] {
+            assert_eq!(
+                clip_frame(&mut player, clip),
+                Some(frame),
+                "{clip} should stay"
+            );
+        }
     }
 
     /// A movie laid out like Metropolis Files' launcher, whose parts have reported their

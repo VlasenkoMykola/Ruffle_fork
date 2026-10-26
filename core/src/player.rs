@@ -50,7 +50,7 @@ use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
 use crate::orphan_manager::OrphanManager;
 use crate::prelude::*;
-use crate::root_timeline::{GameScenes, RootTimeline};
+use crate::root_timeline::{GameScenes, RootTimeline, fill_frame_variables};
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
 use crate::string::{AvmString, AvmStringInterner, StringContext};
@@ -887,9 +887,14 @@ impl Player {
 
     /// Makes a game that keeps its own list of scenes switch to the scene at `index`
     /// in [`RootTimeline::game_scenes`], the way its own controls do.
+    ///
+    /// The variables that the game's code picks the frames of movie clips with, like the
+    /// version of a character picked earlier in the game, are given values first if they
+    /// have none, as the code that gives them values is skipped.
     pub fn goto_game_scene(&mut self, index: usize) {
         self.mutate_with_update_context(|context| {
             if let Some(root) = context.stage.root_clip() {
+                fill_frame_variables(context, root);
                 GameScenes::show(context, root, index);
                 Self::run_actions(context);
             }
@@ -900,8 +905,13 @@ impl Player {
     /// from there, as if the movie called `gotoAndPlay(frame)` on its root timeline.
     ///
     /// Use the `start` of a scene from [`Player::root_timeline`] to jump to that scene.
+    /// Like [`Player::goto_game_scene`], it gives values to the variables that the movie
+    /// picks frames with first.
     pub fn goto_and_play_root_frame(&mut self, frame: u16) {
         self.mutate_with_update_context(|context| {
+            if let Some(root) = context.stage.root_clip() {
+                fill_frame_variables(context, root);
+            }
             if let Some(mc) = context
                 .stage
                 .root_clip()

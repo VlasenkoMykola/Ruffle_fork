@@ -60,7 +60,22 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
   `_root.gotoAndPlay(n)`, `_level0...` or `tellTarget("_root")` in any code. For old games
   that keep their parts on one long timeline, like Tsunade's Debt (1524 frames, 36 jumps
   on the main timeline, no labels). Reading all of Ruffle's 4931 test SWFs this way takes
-  3.4 s in all.
+  3.4 s in all. `code_blocks` lists the code it reads, with whether each block's own target
+  is the root.
+- Frame variables: games like Universal Soldier pick the version of a character a clip
+  shows with a variable set earlier (`gotoAndStop(_root.char)`), which a menu jump skips,
+  leaving the clip playing through all its versions. Before each jump,
+  `Player::goto_game_scene` and `Player::goto_and_play_root_frame` call
+  `fill_frame_variables`, which gives each variable read in the frame of a
+  GotoFrame2 or `gotoAndStop`/`gotoAndPlay` call that has no value the first constant the
+  code gives a variable of that name (by `SetVariable`, `SetMember` or a timeline's
+  `var`), or else 1. `frame_variables` finds them, following the stack like `scan_jumps`
+  (with registers, and the ones `DefineFunction2` preloads): `_root.x`, `/:x`, `_level0.x`,
+  `this.x` and a bare `x` in the root's code are the root's; `_global.x` and a bare `x` in
+  a clip's code (from SWF 6, as a clip without it reads `_global`'s) are `_global`'s;
+  `_parent.x` in a clip's code is taken for the root's. Names starting with `_` are left
+  out, as properties. Whether conditions like `if (_root.hat == 1) gotoAndStop(2)` need
+  the same is open, until the user's `swfinfo.py --variables` output shows such games.
 - Tests: `cargo test -p ruffle_core --lib root_timeline`. They build their game movies with
   the `swf` crate, in the variable layouts below, and with exported clips for the version
   without a list.
