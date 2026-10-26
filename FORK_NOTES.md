@@ -277,6 +277,18 @@ jumps doesn't hide code, and it ignores garbled constant pools as decoys. Change
 checked against Ruffle's test SWFs (`tests/tests/swfs/avm1` and `avm2`), which it should all
 read without errors.
 
+## tools/push_games.py
+
+Copies the user's games to their Android device with adb (Python 3, standard library only):
+`python push_games.py [--dest /sdcard/SWF_Games] [--serial X] [--adb path] [--dry-run]
+[folder]`. Each direct subfolder of the folder (the current one by default) with a `.swf`
+file in it is a game, copied whole to the device's folder of the same name, unless a folder
+of that name is already there (ignoring case). Games are pushed as `<name>.partial` and
+renamed when complete, so a cut-off copy is redone on the next run. It finds adb on the
+PATH or in Android Studio's `%LOCALAPPDATA%\Android\Sdk\platform-tools`, quotes names
+for the device's shell (games have names like `Tsunade's Debt`), and was tested against a
+stand-in for adb, as no device was connected to the session.
+
 `tools/scene-test-swfs` has a small AVM1 assembler (`asm.py`) and `mc_like.py`, which writes
 a movie with the scene code of Mortal Combat's version of the engine, used to check that
 version's scene switching in core.
