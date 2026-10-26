@@ -6,6 +6,7 @@ Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folde
        python swfinfo.py --unsupported [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --unsupported-names [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --scenes <file> [<file> ...]
+       python swfinfo.py --variables <file> [<file> ...]
 
 For each file it prints the ActionScript version, frame count, scenes, frame
 labels, the frames where the main timeline stops, the frames and labels the
@@ -34,6 +35,12 @@ bundled in HTML games.
 movie has under each name: the movie clip the game shows for it, its labels, and
 what its code uses. The code of the main timeline follows, where the game sets up
 the list and switches between its scenes.
+
+--variables lists the code that picks the frame of a clip with a variable or a
+condition, like the version of a character a game shows once the player picked it,
+and where the game sets the variables that code reads. A scene opened from the
+scene menu skips the code that sets them, which leaves such clips playing through
+all of their versions.
 
 Names with * or ? in them are expanded, as the Windows command line doesn't, so
 python swfinfo.py "parts/mq*" describes every file whose name starts with mq.
@@ -516,6 +523,303 @@ def disassemble(data, start, end):
     return lines
 
 
+# Names that stand for timelines in paths, which aren't variables of their own
+PATH_NAMES = re.compile(r"^(_root|_parent|_global|_level\d+|this|super)$", re.I)
+PROPERTIES = [
+    "_x", "_y", "_xscale", "_yscale", "_currentframe", "_totalframes", "_alpha", "_visible",
+    "_width", "_height", "_rotation", "_target", "_framesloaded", "_name", "_droptarget", "_url",
+    "_highquality", "_focusrect", "_soundbuftime", "_quality", "_xmouse", "_ymouse",
+]
+# Global names that are constants
+CONSTANT_NAMES = {"NaN", "Infinity", "newline"}
+BINARY_OPERATORS = {
+    0x0A: "+", 0x47: "+", 0x0B: "-", 0x0C: "*", 0x0D: "/", 0x3F: "%", 0x21: "add", 0x0E: "==",
+    0x49: "==", 0x66: "===", 0x0F: "<", 0x48: "<", 0x67: ">", 0x29: "lt", 0x68: "gt", 0x13: "eq",
+    0x10: "and", 0x11: "or", 0x60: "&", 0x61: "|", 0x62: "^", 0x63: "<<", 0x64: ">>", 0x65: ">>>",
+    0x54: "instanceof",
+}
+UNARY_FUNCTIONS = {
+    0x18: "int", 0x4A: "Number", 0x4B: "String", 0x14: "length", 0x31: "mblength", 0x32: "ord",
+    0x33: "chr", 0x36: "mbord", 0x37: "mbchr", 0x44: "typeof", 0x45: "targetPath",
+    0x30: "random", 0x2B: "cast",
+}
+
+
+class Value:
+    """A value that code works out, read without running it: its code, as text, the
+    variables it reads, and the constant it is, if it is one."""
+
+    def __init__(self, text, reads=(), constant=None, leaf=None, call=False):
+        self.text = text
+        self.reads = set(reads)  # Variables read to work it out, but the one it is
+        self.constant = constant
+        self.leaf = leaf  # The variable or member it is, last in its path
+        self.call = call  # Whether it's what a call returns
+
+    def variables(self):
+        return self.reads | ({self.leaf} if self.leaf else set())
+
+
+class Statement:
+    def __init__(self, offset, kind, text, reads=(), sets=None, frame=None, function=None):
+        self.offset = offset
+        self.function = function  # The name of the function it's in, if it's in one
+        self.kind = kind  # "set", "goto", "if" or "other"
+        self.text = text
+        self.reads = set(reads)  # The variables the value set, the frame or the condition reads
+        self.sets = sets  # The variable or member a "set" sets, last in its path
+        self.frame = frame  # The Value of the frame a "goto" goes to
+
+
+def path_leaf(path):
+    """The variable that a path like _root.hero.hat, /hero:hat or hat names."""
+    leaf = re.split(r"[.:/]", path)[-1]
+    return None if not leaf or PATH_NAMES.match(leaf) else leaf
+
+
+def read_function(data, pos, code):
+    """(name, parameter names, registers they and the preloaded values go in, code size) of a
+    DefineFunction(2) action whose body starts at `pos`."""
+    body = Reader(data, pos)
+    name = body.cstring()
+    count = body.u16()
+    registers, params = {}, []
+    if code == 0x9B:
+        params = [body.cstring() for _ in range(count)]
+    else:
+        body.u8()  # Register count
+        flags = body.u16()
+        # Preloaded values go in registers from 1, in this order.
+        register = 1
+        for flag, preloaded in ((0x01, "this"), (0x04, "arguments"), (0x10, "super"),
+                                (0x40, "_root"), (0x80, "_parent"), (0x100, "_global")):
+            if flags & flag:
+                registers[register] = Value(preloaded)
+                register += 1
+        for _ in range(count):
+            param_register = body.u8()
+            param = body.cstring()
+            params.append(param)
+            if param_register:
+                registers[param_register] = Value(param)
+    return name, params, registers, body.u16()
+
+
+def statements(data, start, end):
+    """The statements of the AVM1 code in data[start:end], as far as reading it without
+    running it tells, in address order. Values it can't work out are "?"."""
+    constants, stack, registers, result = [], [], {}, []
+    # (end, stack, registers, name, local names) of the functions being read, innermost last,
+    # with what they replace
+    functions = []
+    local_names = None  # The parameters and local variables of the function being read
+
+    def pop():
+        return stack.pop() if stack else Value("?")
+
+    def pop_count():
+        count = pop().constant
+        return count if type(count) is int and 0 <= count <= 256 else None
+
+    def add(offset, kind, text, reads=(), sets=None, frame=None):
+        indent = "  " * len(functions)
+        function = (functions[-1][3] or "(anonymous)") if functions else None
+        result.append(Statement(offset - start, kind, indent + text, reads, sets, frame, function))
+
+    def name_of(value):
+        return value.constant if type(value.constant) is str else f"[{value.text}]"
+
+    for offset, code, pos, length in decode_actions(data, start, end):
+        while functions and offset >= functions[-1][0]:
+            _, stack, registers, function, local_names = functions.pop()
+            add(offset, "other", "}")
+            if not function:
+                stack.append(Value("function"))
+        body = Reader(data, pos)
+        try:
+            if code == 0x88:  # ConstantPool
+                pool = [body.cstring() for _ in range(body.u16())]
+                if not looks_like_decoy(pool):
+                    constants = pool
+            elif code == 0x96:  # Push
+                for value in push_values(data, pos, pos + length, constants):
+                    if isinstance(value, Special) and re.match(r"r\d+$", value):
+                        stack.append(registers.get(int(value[1:]), Value(value)))
+                    else:
+                        stack.append(Value(repr(value) if type(value) is str else str(value),
+                                           constant=value))
+            elif code == 0x1C:  # GetVariable
+                name = pop()
+                if type(name.constant) is str:
+                    local = local_names is not None and name.constant in local_names
+                    leaf = None if local or name.constant in CONSTANT_NAMES else path_leaf(name.constant)
+                    stack.append(Value(name.constant, leaf=leaf))
+                else:
+                    stack.append(Value(f"eval({name.text})", name.variables()))
+            elif code == 0x4E:  # GetMember
+                member, target = pop(), pop()
+                if type(member.constant) is str:
+                    leaf = None if PATH_NAMES.match(member.constant) else member.constant
+                    stack.append(Value(f"{target.text}.{member.constant}", target.reads, leaf=leaf))
+                else:
+                    stack.append(Value(f"{target.text}[{member.text}]",
+                                       target.variables() | member.variables()))
+            elif code == 0x1D:  # SetVariable
+                value, name = pop(), pop()
+                if type(name.constant) is str:
+                    add(offset, "set", f"{name.constant} = {value.text}", value.variables(),
+                        path_leaf(name.constant))
+                else:
+                    add(offset, "set", f"set({name.text}, {value.text})", value.variables())
+            elif code == 0x4F:  # SetMember
+                value, member, target = pop(), pop(), pop()
+                if type(member.constant) is str:
+                    add(offset, "set", f"{target.text}.{member.constant} = {value.text}",
+                        value.variables(), member.constant)
+                else:
+                    add(offset, "set", f"{target.text}[{member.text}] = {value.text}", value.variables())
+            elif code in (0x3C, 0x41):  # DefineLocal(2)
+                value = pop() if code == 0x3C else None
+                name = name_of(pop())
+                # In a function, it's a local variable, which isn't the game's; elsewhere, one
+                # of the timeline.
+                if local_names is not None:
+                    local_names.add(name)
+                text = f"var {name}" + (f" = {value.text}" if value else "")
+                add(offset, "set", text, value.variables() if value else (),
+                    None if local_names is not None else name)
+            elif code == 0x23:  # SetProperty
+                value, index, target = pop(), pop(), pop()
+                prop = PROPERTIES[index.constant] if type(index.constant) is int and \
+                    0 <= index.constant < len(PROPERTIES) else index.text
+                add(offset, "set", f"setProperty({target.text}, {prop}, {value.text})", value.variables())
+            elif code == 0x22:  # GetProperty
+                index, target = pop(), pop()
+                prop = PROPERTIES[index.constant] if type(index.constant) is int and \
+                    0 <= index.constant < len(PROPERTIES) else index.text
+                stack.append(Value(f"getProperty({target.text}, {prop})", target.variables()))
+            elif code in BINARY_OPERATORS:
+                right, left = pop(), pop()
+                stack.append(Value(f"({left.text} {BINARY_OPERATORS[code]} {right.text})",
+                                   left.variables() | right.variables()))
+            elif code in UNARY_FUNCTIONS:
+                value = pop()
+                stack.append(Value(f"{UNARY_FUNCTIONS[code]}({value.text})", value.variables()))
+            elif code == 0x12:  # Not
+                value = pop()
+                stack.append(Value(f"!{value.text}", value.variables()))
+            elif code in (0x50, 0x51):  # Increment, Decrement
+                value = pop()
+                stack.append(Value(f"({value.text} {'+' if code == 0x50 else '-'} 1)", value.variables()))
+            elif code == 0x4C:  # PushDuplicate
+                value = pop()
+                stack += [value, value]
+            elif code == 0x4D:  # StackSwap
+                top, below = pop(), pop()
+                stack += [top, below]
+            elif code == 0x87:  # StoreRegister
+                registers[body.u8()] = stack[-1] if stack else Value("?")
+            elif code == 0x17:  # Pop
+                value = pop()
+                if value.call:
+                    add(offset, "other", value.text, value.variables())
+            elif code in (0x3D, 0x52, 0x40, 0x53):  # CallFunction, CallMethod, NewObject, NewMethod
+                name = pop()
+                target = pop() if code in (0x52, 0x53) else None
+                count = pop_count()
+                if count is None:
+                    stack = [Value("?")]
+                    continue
+                args = [pop() for _ in range(count)]
+                reads = set().union(*(arg.variables() for arg in args))
+                function = name.constant if type(name.constant) is str else None
+                if target is None:
+                    callee = function or f"[{name.text}]"
+                else:
+                    callee = target.text + (f".{function}" if function else "")
+                text = ("new " if code in (0x40, 0x53) else "") + \
+                    f"{callee}({', '.join(arg.text for arg in args)})"
+                if function in ("gotoAndPlay", "gotoAndStop") and args:
+                    add(offset, "goto", text, args[0].variables(), frame=args[0])
+                    stack.append(Value("undefined"))
+                else:
+                    stack.append(Value(text, reads | (target.reads if target else set()), call=True))
+            elif code == 0x9F:  # GotoFrame2
+                flags = body.u8()
+                frame = pop()
+                add(offset, "goto", f"{'gotoAndPlay' if flags & 1 else 'gotoAndStop'}({frame.text})",
+                    frame.variables(), frame=frame)
+            elif code == 0x81:  # GotoFrame
+                frame = body.u16() + 1
+                add(offset, "goto", f"gotoFrame({frame})", frame=Value(str(frame), constant=frame))
+            elif code == 0x8C:  # GotoLabel
+                label = body.cstring()
+                add(offset, "goto", f"gotoLabel({label!r})", frame=Value(repr(label), constant=label))
+            elif code in (0x04, 0x05, 0x06, 0x07):
+                add(offset, "other", {0x04: "nextFrame()", 0x05: "prevFrame()", 0x06: "play()",
+                                      0x07: "stop()"}[code])
+            elif code == 0x8B:  # SetTarget
+                target = body.cstring()
+                add(offset, "other", f"tellTarget({target!r}) {{" if target else "}")
+            elif code == 0x20:  # SetTarget2
+                add(offset, "other", f"tellTarget({pop().text}) {{")
+            elif code == 0x9D:  # If
+                condition = pop()
+                add(offset, "if", f"if {condition.text} -> {pos + length + body.i16() - start:04x}",
+                    condition.variables())
+            elif code == 0x99:  # Jump
+                add(offset, "other", f"-> {pos + length + body.i16() - start:04x}")
+            elif code == 0x26:  # Trace
+                add(offset, "other", f"trace({pop().text})")
+            elif code == 0x3E:  # Return
+                value = pop()
+                add(offset, "other", f"return {value.text}", value.variables())
+            elif code == 0x42:  # InitArray
+                count = pop_count()
+                if count is None:
+                    stack = [Value("?")]
+                    continue
+                items = [pop() for _ in range(count)]
+                stack.append(Value(f"[{', '.join(item.text for item in items)}]",
+                                   set().union(*(item.variables() for item in items))))
+            elif code == 0x43:  # InitObject
+                count = pop_count()
+                if count is None:
+                    stack = [Value("?")]
+                    continue
+                pairs = [(pop(), pop()) for _ in range(count)]
+                stack.append(Value("{" + ", ".join(f"{name_of(name)}: {value.text}"
+                                                   for value, name in pairs) + "}",
+                                   set().union(*(value.variables() for value, _ in pairs))))
+            elif code == 0x3A:  # Delete
+                member, target = pop(), pop()
+                stack.append(Value(f"delete {target.text}.{name_of(member)}", call=True))
+            elif code == 0x3B:  # Delete2
+                stack.append(Value(f"delete {name_of(pop())}", call=True))
+            elif code in (0x9B, 0x8E):  # DefineFunction(2)
+                name, params, function_registers, size = read_function(data, pos, code)
+                add(offset, "other", f"function {name}({', '.join(params)}) {{")
+                functions.append((pos + length + size, stack, registers, name, local_names))
+                stack, registers, local_names = [], dict(function_registers), set(params)
+            elif code == 0x9E:  # Call
+                add(offset, "other", f"call({pop().text})")
+            elif code == 0x9A:  # GetURL2
+                target, url = pop(), pop()
+                add(offset, "other", f"getURL({url.text}, {target.text})")
+            elif code == 0x34:  # GetTime
+                stack.append(Value("getTimer()"))
+            elif code == 0x00:  # End
+                pass
+            else:  # What it does to the stack isn't followed, so it's forgotten.
+                stack = []
+        except (IndexError, ValueError, struct.error):
+            stack = []
+    while functions:
+        functions.pop()
+        add(end, "other", "}")
+    return result
+
+
 def button_1_actions(data, start, end):
     pos = start + 2  # Button ID
     while pos < end and data[pos]:  # Button records end with a 0
@@ -838,9 +1142,15 @@ class Timeline:
             handlers = clip_actions(self.data, start, end, self.version)
         except (IndexError, ValueError, struct.error):
             return actions
+        try:
+            character = placed_character(PLACE_OBJECT_2, self.data, start)
+            name = placed_name(PLACE_OBJECT_2, self.data, start)
+        except (IndexError, ValueError, struct.error):
+            character, name = None, None
+        clip = ("the clip" if character is None else f"clip #{character}") + (f" {name!r}" if name else "")
         for depth, events, code_start, code_end in handlers:
             actions.scan(self.data, code_start, code_end)
-            self.blocks.append((f"{where}, onClipEvent({events}) of the clip at depth {depth}",
+            self.blocks.append((f"{where}, onClipEvent({events}) of {clip} at depth {depth}",
                                 code_start, code_end))
         self.nested.merge(actions)
         return actions
@@ -860,6 +1170,32 @@ def placed_character(code, data, start):
     else:
         reader.u16()  # Depth
     return reader.u16() if flags & 0x02 else None
+
+
+def placed_name(code, data, start):
+    """The instance name that a PlaceObject tag gives what it places, if it gives one."""
+    if code == PLACE_OBJECT:
+        return None
+    flags = data[start]
+    reader = Reader(data, start + 1)
+    if code == PLACE_OBJECT_3:
+        flags_2 = reader.u8()
+        reader.u16()  # Depth
+        if flags_2 & 0x08 or (flags_2 & 0x10 and flags & 0x02):
+            reader.cstring()  # Class name
+    else:
+        reader.u16()  # Depth
+    if not flags & 0x20:
+        return None
+    if flags & 0x02:
+        reader.u16()  # Character ID
+    if flags & 0x04:
+        reader.pos = skip_matrix(data, reader.pos)
+    if flags & 0x08:
+        reader.pos = skip_color_transform(data, reader.pos)
+    if flags & 0x10:
+        reader.u16()  # Ratio
+    return reader.cstring()
 
 
 def not_swf_kind(data):
@@ -907,6 +1243,8 @@ class Movie:
         # The characters placed on the main timeline, and the frames each button's code
         # jumps its timeline to
         self.root_children, self.button_jumps = set(), {}
+        # Where each character is placed, and the instance names it's given
+        self.placements, self.instance_names = {}, {}
         self.exports, self.imports = {}, []
         self.tag_counts = {}
         frame = 1
@@ -934,10 +1272,7 @@ class Movie:
             elif code == PLACE_OBJECT_2:
                 timeline.placed_code(f"frame {frame}", start, end)
             if code in (PLACE_OBJECT, PLACE_OBJECT_2, PLACE_OBJECT_3):
-                try:
-                    self.root_children.add(placed_character(code, body, start))
-                except (IndexError, struct.error):
-                    pass
+                self.root_children.add(self.note_placement(code, start, f"frame {frame}"))
             elif code == DO_INIT_ACTION:
                 sprite_id = struct.unpack_from("<H", body, start)[0]
                 init = Actions()
@@ -971,10 +1306,7 @@ class Movie:
                     if sub_code == PLACE_OBJECT_2:
                         own.merge(sprite.placed_code(f"clip #{sprite_id} frame {sub_frame}", sub_start, sub_end))
                     if sub_code in (PLACE_OBJECT, PLACE_OBJECT_2, PLACE_OBJECT_3):
-                        try:
-                            child = placed_character(sub_code, body, sub_start)
-                        except (IndexError, struct.error):
-                            child = None
+                        child = self.note_placement(sub_code, sub_start, f"clip #{sprite_id} frame {sub_frame}")
                         if child is not None:
                             children.add(child)
                 self.own_strings.setdefault(sprite_id, []).extend(own.strings)
@@ -1013,6 +1345,20 @@ class Movie:
         # Like Flash, FrameLabel tags only count when there's no scene data.
         self.labels = scene_labels if scenes is not None else frame_labels
         self.scenes = scenes or []
+
+    def note_placement(self, code, start, where):
+        """The ID of the character that the PlaceObject tag at `start` places, if it names one,
+        after noting where it's placed and its name."""
+        try:
+            character = placed_character(code, self.body, start)
+            name = placed_name(code, self.body, start)
+        except (IndexError, ValueError, struct.error):
+            return None
+        if character is not None:
+            self.placements.setdefault(character, []).append(where)
+            if name:
+                self.instance_names.setdefault(character, []).append(name)
+        return character
 
     def text(self):
         """The readable strings in the file, where file names would appear."""
@@ -1323,6 +1669,111 @@ def describe_scenes(path):
                 print("      " + line)
 
 
+MAX_PICKING_BLOCKS = 30
+MAX_SETS = 12
+
+
+def describe_variables(path):
+    """Prints the code that picks the frame of a timeline with a variable, like the version
+    of a character a game shows once it's been picked, and where the game sets those
+    variables. A scene opened from the scene menu skips the code that sets them, which
+    leaves such clips playing through all of their frames."""
+    name = os.path.basename(path)
+    data = open(path, "rb").read()
+    if len(data) <= 8 or decompress(data) is None:
+        print(f"== {name}: not a SWF ({not_swf_kind(data)})")
+        return
+    m = Movie(data)
+    if m.as3:
+        print(f"== {name}: AS3, whose code this doesn't read")
+        return
+    sprites = {sprite_id: frames for sprite_id, frames, _ in m.sprites}
+
+    def about(character):
+        """What a character is, and where it's placed."""
+        details = []
+        if character in m.exports:
+            details.append(f"exported as {m.exports[character]!r}")
+        if character in sprites:
+            details.append(f"{sprites[character]} frames")
+        names = dedupe(m.instance_names.get(character, []))
+        if names:
+            details.append(f"named {limited(names, repr, 5)}")
+        places = dedupe(m.placements.get(character, []))
+        if places:
+            details.append(f"placed on {limited(places, str, 5)}")
+        return ", ".join(details)
+
+    blocks = []
+    for title, start, end in m.blocks:
+        try:
+            blocks.append((title, statements(m.body, start, end)))
+        except Exception as e:  # One odd block shouldn't hide the rest
+            print(f"   (couldn't read the code of {title}: {type(e).__name__}: {e})")
+    picking, read = [], set()
+    for title, code in blocks:
+        # Within a clip, a jump to a frame that depends on a condition picks it too.
+        in_clip = not title.startswith("button ") and not re.match(r"frame \d+$", title)
+        conditions, picks = set(), []
+        for index, statement in enumerate(code):
+            if statement.kind == "if":
+                conditions |= statement.reads
+            elif statement.kind == "goto":
+                if statement.frame is None or statement.frame.constant is None:
+                    picks.append(index)
+                    read |= statement.reads
+                elif in_clip and conditions:
+                    picks.append(index)
+        if picks:
+            if in_clip:
+                read |= conditions
+            picking.append((title, code, picks))
+    read = {variable for variable in read if variable not in PROPERTIES}
+    print(f"== {name}: {len(picking)} blocks of code pick a frame with a variable or a condition")
+    for title, code, picks in picking[:MAX_PICKING_BLOCKS]:
+        character = re.search(r"clip #(\d+)", title)
+        details = about(int(character.group(1))) if character else ""
+        button = re.match(r"button #(\d+)", title)
+        if button:
+            details = about(int(button.group(1)))
+        print(f"   -- {title}" + (f" ({details})" if details else ""))
+        # Long blocks are cut down to what comes just before the jumps.
+        shown = set(range(len(code))) if len(code) <= 40 else \
+            {line for pick in picks for line in range(pick - 10, pick + 3)}
+        last = -1
+        for index, statement in enumerate(code):
+            if index in shown:
+                if index > last + 1:
+                    print("      ...")
+                print(f"      {statement.offset:04x}  {statement.text}")
+                last = index
+        if last < len(code) - 1:
+            print("      ...")
+    if len(picking) > MAX_PICKING_BLOCKS:
+        print(f"   ... (+{len(picking) - MAX_PICKING_BLOCKS} more blocks)")
+    if not read:
+        return
+    print(f"   where the variables they read are set ({len(read)}):")
+    for variable in sorted(read, key=str.lower):
+        sets = [(title, statement) for title, code in blocks for statement in code
+                if statement.kind == "set" and statement.sets
+                and statement.sets.lower() == variable.lower()]
+        if not sets:
+            print(f"      {variable}: not set by this file's code")
+            continue
+        print(f"      {variable} ({len(sets)}):")
+        for title, statement in sets[:MAX_SETS]:
+            button = re.match(r"button #(\d+)", title)
+            places = dedupe(m.placements.get(int(button.group(1)), [])) if button else []
+            where = title + (f" (placed on {limited(places, str, 3)})" if places else "")
+            where += f" @{statement.offset:04x}"
+            if statement.function:
+                where += f", in function {statement.function}"
+            print(f"         {where}: {statement.text.strip()}")
+        if len(sets) > MAX_SETS:
+            print(f"         ... (+{len(sets) - MAX_SETS} more)")
+
+
 def launcher_method(path, movie):
     """(status, description) of a launcher, from the parts it names (that it loads over
     itself): supported when it keeps its scene list in _global and a part has the code that
@@ -1467,8 +1918,9 @@ def main(args):
     max_depth = 1 if "--onefolderdeep" in args else None
     unsupported_only = "--unsupported" in args or names_only
     classifying, scenes = "--classify" in args or unsupported_only, "--scenes" in args
+    variables = "--variables" in args
     modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes",
-             "--onefolderdeep")
+             "--variables", "--onefolderdeep")
     unknown_modes = [arg for arg in args if arg.startswith("--") and arg not in modes]
     if unknown_modes:  # It would be taken for a file name, and everything else described
         print(f"Unknown option {unknown_modes[0]}; this version has: {', '.join(modes)}")
@@ -1488,10 +1940,10 @@ def main(args):
         pass
     if classifying:
         return classify(args, unsupported_only, names_only, max_depth)
-    if scenes:
+    if scenes or variables:
         for path in args:
             try:
-                describe_scenes(path)
+                (describe_scenes if scenes else describe_variables)(path)
             except Exception as e:  # Keep going, so one odd file doesn't hide the rest
                 print(f"== {os.path.basename(path)}  (couldn't read: {type(e).__name__}: {e})")
         return 0

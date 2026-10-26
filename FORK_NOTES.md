@@ -271,6 +271,12 @@ output they paste back, since the games themselves aren't shared:
 - `--scenes <files>`: for games with their own scene list, each entry with the clip the
   movie exports under that name (frames, labels, which engine functions and variables its
   code and the code inside it use), or that it has none; then the main timeline's code.
+- `--variables <files>`: the code that picks a timeline's frame with a variable (or, in a
+  clip, with a condition), like a character's version picked earlier in the game, then
+  where the game sets each variable that code reads (with the frame a button sits on,
+  and the function an assignment is in). Scenes opened from the scene menu skip the code
+  that sets them, leaving such clips playing through all their versions. Its `statements`
+  rebuilds statements from the bytecode's stack, as far as reading without running tells.
 
 It reads AVM1 code the way it runs (following jumps, branches and functions), so junk after
 jumps doesn't hide code, and it ignores garbled constant pools as decoys. Changes are best
