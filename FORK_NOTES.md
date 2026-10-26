@@ -289,6 +289,10 @@ PATH or in Android Studio's `%LOCALAPPDATA%\Android\Sdk\platform-tools`, quotes 
 for the device's shell (games have names like `Tsunade's Debt`), and was tested against a
 stand-in for adb, as no device was connected to the session.
 
+`tools/games_size.py [folder]` lists the size of each of those games (folder and all),
+largest first, and their total, to see the space they need; `push_games.py --dry-run` gives
+the size of only the ones not on the device yet.
+
 `tools/scene-test-swfs` has a small AVM1 assembler (`asm.py`) and `mc_like.py`, which writes
 a movie with the scene code of Mortal Combat's version of the engine, used to check that
 version's scene switching in core.
