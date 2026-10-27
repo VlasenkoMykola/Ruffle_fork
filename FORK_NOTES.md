@@ -289,8 +289,11 @@ output they paste back, since the games themselves aren't shared:
 - `--variables <files>`: the code that picks a timeline's frame with a variable (or, in a
   clip, with a condition), like a character's version picked earlier in the game, then
   where the game sets each variable that code reads (with the frame a button sits on,
-  and the function an assignment is in). Scenes opened from the scene menu skip the code
-  that sets them, leaving such clips playing through all their versions. Its `statements`
+  and the function an assignment is in). Then the clips that other code moves between
+  frames (`gotoAndStop`, `nextFrame`, `stop`... called on them, or in `tellTarget`) or shows
+  and hides (`_visible`), with the clips placed under that name and whether each stops
+  itself, for games like Gotham City, whose clips no variable picks. Scenes opened from the
+  scene menu skip that code, leaving such clips playing through all their versions. Its `statements`
   rebuilds statements from the bytecode's stack, as far as reading without running tells.
 
 It reads AVM1 code the way it runs (following jumps, branches and functions), so junk after

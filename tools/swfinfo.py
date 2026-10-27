@@ -38,9 +38,11 @@ the list and switches between its scenes.
 
 --variables lists the code that picks the frame of a clip with a variable or a
 condition, like the version of a character a game shows once the player picked it,
-and where the game sets the variables that code reads. A scene opened from the
-scene menu skips the code that sets them, which leaves such clips playing through
-all of their versions.
+and where the game sets the variables that code reads. Then the clips that other code
+moves between frames (gotoAndStop, nextFrame, stop... on them, or in tellTarget) or
+shows and hides (_visible), like a character's versions picked by buttons, with
+whether each stops by itself. A scene opened from the scene menu skips that code,
+which leaves such clips playing through all of their versions.
 
 Names with * or ? in them are expanded, as the Windows command line doesn't, so
 python swfinfo.py "parts/mq*" describes every file whose name starts with mq.
@@ -561,9 +563,13 @@ class Value:
 
 
 class Statement:
-    def __init__(self, offset, kind, text, reads=(), sets=None, frame=None, function=None):
+    def __init__(self, offset, kind, text, reads=(), sets=None, frame=None, function=None,
+                 target=None):
         self.offset = offset
         self.function = function  # The name of the function it's in, if it's in one
+        # The timeline that it moves between frames, or shows or hides, when it's another's
+        # than the code's own, like `_root.hero` in _root.hero.gotoAndStop(2)
+        self.target = target
         self.kind = kind  # "set", "goto", "if" or "other"
         self.text = text
         self.reads = set(reads)  # The variables the value set, the frame or the condition reads
@@ -613,6 +619,7 @@ def statements(data, start, end):
     # with what they replace
     functions = []
     local_names = None  # The parameters and local variables of the function being read
+    told = None  # The target of tellTarget, if the code is in one
 
     def pop():
         return stack.pop() if stack else Value("?")
@@ -621,10 +628,11 @@ def statements(data, start, end):
         count = pop().constant
         return count if type(count) is int and 0 <= count <= 256 else None
 
-    def add(offset, kind, text, reads=(), sets=None, frame=None):
+    def add(offset, kind, text, reads=(), sets=None, frame=None, target=None):
         indent = "  " * len(functions)
         function = (functions[-1][3] or "(anonymous)") if functions else None
-        result.append(Statement(offset - start, kind, indent + text, reads, sets, frame, function))
+        result.append(Statement(offset - start, kind, indent + text, reads, sets, frame, function,
+                                target))
 
     def name_of(value):
         return value.constant if type(value.constant) is str else f"[{value.text}]"
@@ -674,8 +682,9 @@ def statements(data, start, end):
             elif code == 0x4F:  # SetMember
                 value, member, target = pop(), pop(), pop()
                 if type(member.constant) is str:
+                    shown = target.text if member.constant.lower() == "_visible" else None
                     add(offset, "set", f"{target.text}.{member.constant} = {value.text}",
-                        value.variables(), member.constant)
+                        value.variables(), member.constant, target=shown)
                 else:
                     add(offset, "set", f"{target.text}[{member.text}] = {value.text}", value.variables())
             elif code in (0x3C, 0x41):  # DefineLocal(2)
@@ -692,7 +701,10 @@ def statements(data, start, end):
                 value, index, target = pop(), pop(), pop()
                 prop = PROPERTIES[index.constant] if type(index.constant) is int and \
                     0 <= index.constant < len(PROPERTIES) else index.text
-                add(offset, "set", f"setProperty({target.text}, {prop}, {value.text})", value.variables())
+                shown = (target.constant if type(target.constant) is str else target.text) \
+                    if prop == "_visible" else None
+                add(offset, "set", f"setProperty({target.text}, {prop}, {value.text})", value.variables(),
+                    target=shown)
             elif code == 0x22:  # GetProperty
                 index, target = pop(), pop()
                 prop = PROPERTIES[index.constant] if type(index.constant) is int and \
@@ -739,8 +751,12 @@ def statements(data, start, end):
                     callee = target.text + (f".{function}" if function else "")
                 text = ("new " if code in (0x40, 0x53) else "") + \
                     f"{callee}({', '.join(arg.text for arg in args)})"
+                moved = target.text if target is not None and code == 0x52 else None
                 if function in ("gotoAndPlay", "gotoAndStop") and args:
-                    add(offset, "goto", text, args[0].variables(), frame=args[0])
+                    add(offset, "goto", text, args[0].variables(), frame=args[0], target=moved)
+                    stack.append(Value("undefined"))
+                elif function in ("nextFrame", "prevFrame", "play", "stop") and moved:
+                    add(offset, "other", text, target=moved)
                     stack.append(Value("undefined"))
                 else:
                     stack.append(Value(text, reads | (target.reads if target else set()), call=True))
@@ -748,21 +764,25 @@ def statements(data, start, end):
                 flags = body.u8()
                 frame = pop()
                 add(offset, "goto", f"{'gotoAndPlay' if flags & 1 else 'gotoAndStop'}({frame.text})",
-                    frame.variables(), frame=frame)
+                    frame.variables(), frame=frame, target=told)
             elif code == 0x81:  # GotoFrame
                 frame = body.u16() + 1
-                add(offset, "goto", f"gotoFrame({frame})", frame=Value(str(frame), constant=frame))
+                add(offset, "goto", f"gotoFrame({frame})", frame=Value(str(frame), constant=frame),
+                    target=told)
             elif code == 0x8C:  # GotoLabel
                 label = body.cstring()
-                add(offset, "goto", f"gotoLabel({label!r})", frame=Value(repr(label), constant=label))
+                add(offset, "goto", f"gotoLabel({label!r})", frame=Value(repr(label), constant=label),
+                    target=told)
             elif code in (0x04, 0x05, 0x06, 0x07):
                 add(offset, "other", {0x04: "nextFrame()", 0x05: "prevFrame()", 0x06: "play()",
-                                      0x07: "stop()"}[code])
+                                      0x07: "stop()"}[code], target=told)
             elif code == 0x8B:  # SetTarget
                 target = body.cstring()
                 add(offset, "other", f"tellTarget({target!r}) {{" if target else "}")
+                told = target or None
             elif code == 0x20:  # SetTarget2
-                add(offset, "other", f"tellTarget({pop().text}) {{")
+                told = pop().text
+                add(offset, "other", f"tellTarget({told}) {{")
             elif code == 0x9D:  # If
                 condition = pop()
                 add(offset, "if", f"if {condition.text} -> {pos + length + body.i16() - start:04x}",
@@ -1751,9 +1771,17 @@ def describe_variables(path):
             print("      ...")
     if len(picking) > MAX_PICKING_BLOCKS:
         print(f"   ... (+{len(picking) - MAX_PICKING_BLOCKS} more blocks)")
-    if not read:
-        return
-    print(f"   where the variables they read are set ({len(read)}):")
+    def where(title, statement):
+        button = re.match(r"button #(\d+)", title)
+        places = dedupe(m.placements.get(int(button.group(1)), [])) if button else []
+        text = title + (f" (placed on {limited(places, str, 3)})" if places else "")
+        text += f" @{statement.offset:04x}"
+        if statement.function:
+            text += f", in function {statement.function}"
+        return text
+
+    if read:
+        print(f"   where the variables they read are set ({len(read)}):")
     for variable in sorted(read, key=str.lower):
         sets = [(title, statement) for title, code in blocks for statement in code
                 if statement.kind == "set" and statement.sets
@@ -1763,15 +1791,60 @@ def describe_variables(path):
             continue
         print(f"      {variable} ({len(sets)}):")
         for title, statement in sets[:MAX_SETS]:
-            button = re.match(r"button #(\d+)", title)
-            places = dedupe(m.placements.get(int(button.group(1)), [])) if button else []
-            where = title + (f" (placed on {limited(places, str, 3)})" if places else "")
-            where += f" @{statement.offset:04x}"
-            if statement.function:
-                where += f", in function {statement.function}"
-            print(f"         {where}: {statement.text.strip()}")
+            print(f"         {where(title, statement)}: {statement.text.strip()}")
         if len(sets) > MAX_SETS:
             print(f"         ... (+{len(sets) - MAX_SETS} more)")
+
+    # Clips that other code moves between frames, or shows and hides, like a character's
+    # versions picked by buttons, which a scene opened from the menu skips too.
+    by_name = {}
+    for character, names in m.instance_names.items():
+        for instance in names:
+            by_name.setdefault(instance.lower(), set()).add(character)
+    own_stops = {}
+    for title, code in blocks:
+        frame = re.match(r"clip #(\d+) frame (\d+)$", title)
+        if frame and any(statement.target is None and statement.text.strip() == "stop()"
+                         for statement in code):
+            own_stops.setdefault(int(frame.group(1)), []).append(int(frame.group(2)))
+    moved = {}
+    for title, code in blocks:
+        for statement in code:
+            if statement.target is None:
+                continue
+            leaf = path_leaf(statement.target.strip("'\""))
+            if leaf:
+                moved.setdefault(leaf.lower(), []).append((title, statement))
+
+    def frames_of(leaf):
+        return max((sprites.get(character, 0) for character in by_name.get(leaf, ())), default=0)
+
+    shown = sorted(moved, key=lambda leaf: (-frames_of(leaf), leaf))
+    if shown:
+        print(f"   clips that other code moves between frames or shows and hides ({len(shown)}):")
+    for leaf in shown[:MAX_PICKING_BLOCKS]:
+        characters = sorted(by_name.get(leaf, ()))
+        if characters:
+            details = []
+            for character in characters[:3]:
+                stops = own_stops.get(character)
+                stopping = f"stops itself on frames {limited(sorted(set(stops)), str, 8)}" \
+                    if stops else "never stops itself"
+                details.append(f"clip #{character}, {sprites.get(character, '?')} frames, {stopping}")
+            about_leaf = "; ".join(details)
+        else:
+            about_leaf = "no clip is placed with this name (attached by code, or a part's?)"
+        statements_of = moved[leaf]
+        print(f"      {leaf!r}: {about_leaf}")
+        for title, statement in statements_of[:MAX_SETS]:
+            text = statement.text.strip()
+            if not text.startswith(statement.target) and not text.startswith("setProperty"):
+                text = f"(in tellTarget({statement.target!r})) {text}"
+            print(f"         {where(title, statement)}: {text}")
+        if len(statements_of) > MAX_SETS:
+            print(f"         ... (+{len(statements_of) - MAX_SETS} more)")
+    if len(shown) > MAX_PICKING_BLOCKS:
+        print(f"      ... (+{len(shown) - MAX_PICKING_BLOCKS} more)")
 
 
 def launcher_method(path, movie):
