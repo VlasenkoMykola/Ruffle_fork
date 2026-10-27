@@ -95,7 +95,12 @@ A movie counts as such a game when its root timeline has a `setScreen` function 
 array in `Qvar`, `scenelist`, `screens` or `screens_list` (each looked up on the root, then
 in `_global`, like the other variables below), or, without those, exports movie clips named `screen1`,
 `screen2`... or `screen_1`, `screen_2`... (the list is then `mainmenu`, the numbered ones in
-order, and the other `screen_*` ones, like `screen_end`). The scene being shown is the one named in
+order, and the other `screen_*` ones, like `screen_end`). A list that names none of the
+movie clips the root movie exports gives way to those clips when there are some: One Piece
+of Luck's launcher leaves `_global.screens` (`screen_0`...) for the part it loads over
+itself, which exports `mainmenu`, `screen1`... and has no list, so the menu called
+`setScreen` with names the part doesn't have, and showed a blank screen. Big Queen 1's
+parts export clips with the names in its launcher's list, which is kept. The scene being shown is the one named in
 `screen_name`, or else numbered (1-based) in `Qpos`, `pos`, `Qmod` or `gn`, or else, for exported
 clips, the one the root's child `screen` is an instance of. To switch, core does what the
 games' own controls do: stop all sounds, show the mouse cursor, and call the root's

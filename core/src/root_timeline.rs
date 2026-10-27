@@ -356,9 +356,41 @@ impl<'gc> SceneList<'gc> {
                 }
                 _ => None,
             });
-        array.or_else(|| {
+        let clips = |activation: &mut Activation<'_, 'gc>| {
             let clips = scene_clips(root, activation.context);
             (!clips.is_empty()).then_some(Self::Clips(clips))
+        };
+        match array {
+            // A launcher can leave its list in _global for the parts it loads over itself,
+            // which export clips of its names, like Big Queen 1's. One Piece of Luck's part,
+            // of the version without a list, exports screen1... while its launcher's list
+            // names screen_0..., which it doesn't have, so its clips are its scenes.
+            Some(list) if !list.names_clip_of(root, activation) => clips(activation).or(Some(list)),
+            None => clips(activation),
+            list => list,
+        }
+    }
+
+    /// Whether a scene of an `Array` list is the export name of a movie clip of `root`'s
+    /// movie. The others always are.
+    fn names_clip_of(
+        &self,
+        root: DisplayObject<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> bool {
+        let Self::Array(list, length) = self else {
+            return true;
+        };
+        (0..*length).any(|index| {
+            let Value::String(name) = list.get_element(activation, index) else {
+                return false;
+            };
+            activation
+                .context
+                .library
+                .library_for_movie(root.movie())
+                .and_then(|library| library.character_by_export_name(&name))
+                .is_some_and(|(_, character)| matches!(character, Character::MovieClip(_)))
         })
     }
 
@@ -1628,6 +1660,12 @@ mod tests {
     /// `setScreen(name)` that attaches the clip exported as `name` as `screen`, which it
     /// does with `mainmenu` first, like the games without a scene list.
     fn game_with_scene_clips(exports: &[&'static str]) -> Vec<u8> {
+        game_with_scene_clips_and_list(exports, &[])
+    }
+
+    /// Like [`game_with_scene_clips`], with `list` in `_global.screens` too, as a launcher
+    /// that loaded the movie over itself left it, like One Piece of Luck's.
+    fn game_with_scene_clips_and_list(exports: &[&'static str], list: &[&'static str]) -> Vec<u8> {
         // attachMovie(name, "screen", 0);
         let show_scene = actions(&[
             push(&[Value::Int(0), string("screen"), string("name")]),
@@ -1636,8 +1674,21 @@ mod tests {
             Action::CallFunction,
             Action::Pop,
         ]);
-        // function setScreen(name) { ... } setScreen("mainmenu");
-        let mut setup = actions(&[
+        // _global.screens = [...]; function setScreen(name) { ... } setScreen("mainmenu");
+        let mut setup = Vec::new();
+        if !list.is_empty() {
+            let mut values = vec![string("_global"), string("screens")];
+            values.extend(list.iter().rev().map(|name| string(name)));
+            values.push(Value::Int(list.len() as i32));
+            setup = actions(&[
+                push(&[string("_global")]),
+                Action::GetVariable,
+                push(&values[1..]),
+                Action::InitArray,
+                Action::SetMember,
+            ]);
+        }
+        setup.extend(actions(&[
             Action::DefineFunction(DefineFunction {
                 name: "setScreen".into(),
                 params: vec!["name".into()],
@@ -1646,7 +1697,7 @@ mod tests {
             push(&[string("mainmenu"), Value::Int(1), string("setScreen")]),
             Action::CallFunction,
             Action::Pop,
-        ]);
+        ]));
         setup.push(0); // End
 
         let mut tags: Vec<_> = (1..)
@@ -1764,6 +1815,27 @@ mod tests {
         let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
         assert_eq!(scenes.current, Some(3));
         assert_eq!(scenes.next(), Some(4));
+
+        // A list that a launcher left in _global, which names none of the clips, like One
+        // Piece of Luck's, isn't the scenes'.
+        let player = load_swf(&game_with_scene_clips_and_list(
+            &["mainmenu", "screen1", "screen2"],
+            &["screen_0", "screen_1"],
+        ));
+        let mut player = player.lock().unwrap();
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(scenes.names, ["mainmenu", "screen1", "screen2"]);
+        // One that names them, like Big Queen 1's, is.
+        let player = load_swf(&game_with_scene_clips_and_list(
+            &["mainmenu", "screen_1", "screen_2"],
+            &["screen_0", "screen_1", "screen_2", "screen_3"],
+        ));
+        let mut player = player.lock().unwrap();
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(
+            scenes.names,
+            ["screen_0", "screen_1", "screen_2", "screen_3"]
+        );
 
         // Names with underscores, like Universal Soldier's and Tifa's Happy Xmas's
         let player = load_swf(&game_with_scene_clips(&[
