@@ -271,6 +271,38 @@ conditions, read from its part `gcs-game`), and One Piece of Luck's and One Piec
 scene menus, which left a blank screen, work in full (their exported clips over a list
 naming none of them).
 
+## Rendering fix: each chunk of draws gets its own transforms
+
+The Metropolis Files games (episodes 1–4, parts `mmtxf1`/`mmtxf2`...) showed many of
+their elements and characters jumping to some offset, the same for each element, and
+back, or vanishing, in normal play on Android. Their scenes are busy: hundreds of shapes
+and morph shapes per part, characters made of many clips (`AnimManager` sends the body
+and its swinging parts, `AnimSwing`, to frames every frame).
+
+`render/wgpu` draws a frame's objects in chunks of up to 200 (`ESTIMATED_OBJECTS_PER_CHUNK`,
+or fewer if the uniform buffer limit is smaller), each with its transforms (matrix and
+color transform) in a uniform buffer that the shaders index with the instance index.
+Every chunk used to copy its transforms into the same buffer, at offset 0, then draw, so a
+frame with more than 200 objects rewrote it between passes to the same target. That's
+valid, but it's what the OpenGL ES drivers of tile-based GPUs defer and get wrong most
+easily, and the Android app uses wgpu's GL backend (`wgpu::Backends::GL`); an object of
+an earlier chunk drawn with the transforms of the next would sit in another object's
+place, the same one each frame, and its color transform could make it invisible.
+`DynamicTransformsPool` (`render/wgpu/src/dynamic_transforms.rs`) now gives each chunk
+of a frame buffers of its own (transforms, bitmap quad vertices and bind group, 32 KiB in
+all), reused from the first once the frame is submitted; past 256 chunks in a frame,
+they're reused in turn. This is a guess from the symptoms, untested on a device when
+made: nothing here or on the emulators reproduces the bug.
+
+Ruled out first: the mouse parallax `move_viewpoint` in their screens (defined, never
+called), and timeline rewinds. A clip that a later frame puts at a depth in place of
+another is kept by Ruffle when going back to before it, if the ratios of the two
+placements match (`survives_rewind`); Flash does the same (Gnash's `loop_test8` and
+`RegisterClassTest4`), and the Flash IDE writes the 0-based frame of each placement into
+its ratio (frame 3 gives `ratio 2`), which tells such clips apart. Comparing characters
+instead broke those tests and the `loop_test`s, where clips keep their place through a
+loop after `swapDepths`.
+
 ## Frontends
 
 - **Desktop** (`desktop/src/gui/menu_bar.rs`): a Scenes menu with the game's scenes or the

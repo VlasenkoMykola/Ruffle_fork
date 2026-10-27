@@ -4,7 +4,7 @@ use crate::blend::TrivialBlend;
 use crate::blend::{BlendType, ComplexBlend};
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
-use crate::dynamic_transforms::DynamicTransforms;
+use crate::dynamic_transforms::DynamicTransformsPool;
 use crate::mesh::{DrawType, Mesh, as_mesh};
 use crate::surface::Surface;
 use crate::surface::target::CommandTarget;
@@ -496,7 +496,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     commands: CommandList,
     descriptors: &'encoder Descriptors,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
-    dynamic_transforms: &'encoder DynamicTransforms,
+    dynamic_transforms: &'encoder DynamicTransformsPool,
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     meshes: &'encoder Vec<Mesh>,
     quality: StageQuality,
@@ -528,7 +528,7 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     nearest_layer: LayerRef<'encoder>,
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
-    dynamic_transforms: &'encoder DynamicTransforms,
+    dynamic_transforms: &'encoder DynamicTransformsPool,
     draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
     texture_pool: &'encoder mut TexturePool,
     emulate_lines: bool,
@@ -546,7 +546,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
     fn new(
         descriptors: &'encoder Descriptors,
         staging_belt: &'encoder mut wgpu::util::StagingBelt,
-        dynamic_transforms: &'encoder DynamicTransforms,
+        dynamic_transforms: &'encoder DynamicTransformsPool,
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         meshes: &'encoder Vec<Mesh>,
         quality: StageQuality,
@@ -587,19 +587,19 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 
     fn new_transforms(
         descriptors: &'encoder Descriptors,
-        dynamic_transforms: &'encoder DynamicTransforms,
+        dynamic_transforms: &'encoder DynamicTransformsPool,
     ) -> BufferBuilder {
         let mut transforms = BufferBuilder::new(&descriptors.limits, 0);
-        transforms.set_buffer_limit(dynamic_transforms.buffer.size());
+        transforms.set_buffer_limit(dynamic_transforms.transforms_size());
         transforms
     }
 
     fn new_vertices(
         descriptors: &'encoder Descriptors,
-        dynamic_transforms: &'encoder DynamicTransforms,
+        dynamic_transforms: &'encoder DynamicTransformsPool,
     ) -> BufferBuilder {
         let mut vertices = BufferBuilder::new(&descriptors.limits, 0);
-        vertices.set_buffer_limit(dynamic_transforms.vertex_buffer.size());
+        vertices.set_buffer_limit(dynamic_transforms.vertices_size());
         vertices
     }
 

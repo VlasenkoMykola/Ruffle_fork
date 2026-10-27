@@ -1,7 +1,7 @@
 use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::{BufferPool, TexturePool};
 use crate::context3d::WgpuContext3D;
-use crate::dynamic_transforms::DynamicTransforms;
+use crate::dynamic_transforms::DynamicTransformsPool;
 use crate::filters::FilterSource;
 use crate::mesh::{CommonGradient, Mesh, PendingDraw};
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
@@ -80,7 +80,7 @@ pub struct WgpuRenderBackend<T: RenderTarget> {
     texture_pool: TexturePool,
     offscreen_texture_pool: TexturePool,
     pub(crate) offscreen_buffer_pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
-    dynamic_transforms: DynamicTransforms,
+    dynamic_transforms: DynamicTransformsPool,
     active_frame: ActiveFrame,
     profiler: GpuProfiler,
 }
@@ -249,7 +249,7 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
             },
         ));
 
-        let transforms = DynamicTransforms::new(&descriptors);
+        let transforms = DynamicTransformsPool::new(&descriptors);
         let active_frame = ActiveFrame::new(&descriptors);
 
         let profiler_settings = GpuProfilerSettings {
@@ -668,6 +668,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
+        self.dynamic_transforms.frame_submitted();
         self.offscreen_texture_pool = TexturePool::new();
         self.profiler
             .end_frame()

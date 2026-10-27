@@ -4,7 +4,7 @@ pub mod target;
 use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
 use crate::buffer_pool::TexturePool;
-use crate::dynamic_transforms::DynamicTransforms;
+use crate::dynamic_transforms::DynamicTransformsPool;
 use crate::filters::FilterSource;
 use crate::mesh::Mesh;
 use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
@@ -70,7 +70,7 @@ impl Surface {
         render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
         staging_belt: &'global mut wgpu::util::StagingBelt,
-        dynamic_transforms: &'global DynamicTransforms,
+        dynamic_transforms: &'global DynamicTransformsPool,
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         meshes: &'global Vec<Mesh>,
         commands: CommandList,
@@ -109,7 +109,7 @@ impl Surface {
         meshes: &'encoder Vec<Mesh>,
         commands: CommandList,
         staging_belt: &'encoder mut wgpu::util::StagingBelt,
-        dynamic_transforms: &'encoder DynamicTransforms,
+        dynamic_transforms: &'encoder DynamicTransformsPool,
         draw_encoder: &'encoder mut Scope<'global, wgpu::CommandEncoder>,
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
@@ -151,6 +151,7 @@ impl Surface {
                     transforms,
                     vertices,
                 } => {
+                    let dynamic_transforms = dynamic_transforms.next(descriptors);
                     transforms.copy_to(staging_belt, draw_encoder, &dynamic_transforms.buffer);
                     vertices.copy_to(
                         staging_belt,
