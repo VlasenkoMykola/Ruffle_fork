@@ -74,8 +74,17 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
   `this.x` and a bare `x` in the root's code are the root's; `_global.x` and a bare `x` in
   a clip's code (from SWF 6, as a clip without it reads `_global`'s) are `_global`'s;
   `_parent.x` in a clip's code is taken for the root's. Names starting with `_` are left
-  out, as properties. Whether conditions like `if (_root.hat == 1) gotoAndStop(2)` need
-  the same is open, until the user's `swfinfo.py --variables` output shows such games.
+  out, as properties. Versions picked with conditions, like Gotham City's girls, which
+  show the person next to them with `if (_root.person1nearGirl1 == true) gotoAndStop(1)`
+  and so on (set to false on the screen where they're placed, and true by its buttons):
+  in a clip's own code (not in its functions), an `If` on `variable == constant` (or a
+  bare variable, for true) that a goto to a fixed frame follows before the `If`'s target
+  is a condition of `Versions`; a clip with more than one, that doesn't stop by itself
+  (`stop()`, or a fixed goto outside the conditions), picks versions, and if none of its
+  conditions holds when the menu jumps, the first one is made to hold (each girl then
+  shows the first person). Both are read from every loaded AVM1 movie
+  (`Library::known_movies`), as games like Gotham City keep their scenes in parts they
+  load, whose code uses `_root`'s variables.
 - Tests: `cargo test -p ruffle_core --lib root_timeline`. They build their game movies with
   the `swf` crate, in the variable layouts below, and with exported clips for the version
   without a list.

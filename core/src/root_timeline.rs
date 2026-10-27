@@ -710,6 +710,27 @@ struct FrameVariable {
 enum Constant {
     Number(f64),
     String(String),
+    Bool(bool),
+}
+
+/// The ways that the code of a movie clip picks the frame it shows, one of its versions,
+/// with conditions, like Gotham City's, which shows the person placed next to a girl with
+/// `if (_root.person1nearGirl1 == true) gotoAndStop(1)`, and so on for the others. A scene
+/// opened from the scene menu skips the code that makes one of them hold, which leaves the
+/// clip playing through all its versions, so the menu makes the first one hold.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Versions {
+    /// That a variable has a value, for each frame it goes to
+    conditions: Vec<(Home, String, Constant)>,
+    /// Whether the clip stops by itself, without any of them holding
+    stops: bool,
+}
+
+/// What the scene menu gives values to before it jumps.
+#[derive(Debug, Default, PartialEq)]
+struct FramePicks {
+    variables: Vec<FrameVariable>,
+    versions: Vec<Versions>,
 }
 
 /// The timeline that code scanned for [`FrameVariable`]s works on.
@@ -730,6 +751,12 @@ enum Item {
     Timeline(Home),
     /// A value worked out from these variables
     Reads(Vec<(Home, String)>),
+    /// Whether a variable has a value, or doesn't, if `holds` is false
+    Test {
+        variable: (Home, String),
+        value: Constant,
+        holds: bool,
+    },
     Other,
 }
 
@@ -737,6 +764,7 @@ impl Item {
     fn reads(self) -> Vec<(Home, String)> {
         match self {
             Item::Reads(reads) => reads,
+            Item::Test { variable, .. } => vec![variable],
             _ => Vec::new(),
         }
     }
@@ -759,14 +787,25 @@ struct VariableUses {
     picks: Vec<(Home, String)>,
     /// The constants that the code gives variables, by name, in the order of the code
     constants: Vec<(String, Constant)>,
+    /// The [`Versions`] of each block of a movie clip's code
+    versions: Vec<Versions>,
 }
 
-/// The [`FrameVariable`]s of the movie whose tag stream is `data`.
-fn frame_variables(data: &[u8], version: u8) -> Vec<FrameVariable> {
+/// The [`FrameVariable`]s and [`Versions`] of the movie whose tag stream is `data`.
+fn frame_variables(data: &[u8], version: u8) -> FramePicks {
     let mut uses = VariableUses::default();
     for (code, on_root) in code_blocks(data, version) {
         let target = if on_root { Target::Root } else { Target::Clip };
+        uses.versions.push(Versions::default());
         scan_variables(code, version, target, false, HashMap::new(), &mut uses);
+    }
+    // A clip picks versions with more than one condition; one alone could be a game's
+    // state, like whether it's paused.
+    let mut versions: Vec<Versions> = Vec::new();
+    for found in uses.versions {
+        if !found.stops && found.conditions.len() > 1 && !versions.contains(&found) {
+            versions.push(found);
+        }
     }
     let mut variables: Vec<FrameVariable> = Vec::new();
     for (home, name) in uses.picks {
@@ -784,7 +823,10 @@ fn frame_variables(data: &[u8], version: u8) -> Vec<FrameVariable> {
             .map_or(Constant::Number(1.0), |(_, value)| value.clone());
         variables.push(FrameVariable { home, name, value });
     }
-    variables
+    FramePicks {
+        variables,
+        versions,
+    }
 }
 
 /// Where a variable that code working on `target` reads by its name alone lives, if it can
@@ -855,11 +897,37 @@ fn scan_variables(
             if name.eq_ignore_ascii_case("gotoAndStop") || name.eq_ignore_ascii_case("gotoAndPlay"))
     };
 
+    // Whether the code is a movie clip's own, which picks the frame it shows, and the
+    // condition that the code being read runs under, with where the code it guards ends
+    let picks_versions = own == Target::Clip && !in_function;
+    let mut guard: Option<((Home, String, Constant), usize)> = None;
+    let mut guarded_until = 0;
+    // Notes a goto of the code's own timeline to a frame it names, at `position`, which
+    // shows a version if a condition guards it, or else stops there.
+    let goto = |guard: &mut Option<((Home, String, Constant), usize)>,
+                position: usize,
+                stops: bool,
+                uses: &mut VariableUses| {
+        let Some(versions) = uses.versions.last_mut() else {
+            return;
+        };
+        match guard.take() {
+            Some((condition, end)) if position < end => versions.conditions.push(condition),
+            _ => versions.stops |= stops,
+        }
+    };
+
     let mut reader = swf::avm1::read::Reader::new(code, version);
     let mut constants: Vec<&SwfStr> = Vec::new();
     let mut stack: Vec<Item> = Vec::new();
     let mut target = own;
-    while let Ok(action) = reader.read_action() {
+    loop {
+        let position = code.len() - reader.get_ref().len();
+        let Ok(action) = reader.read_action() else {
+            break;
+        };
+        let next = code.len() - reader.get_ref().len();
+        let own_goto = picks_versions && target == own;
         match action {
             Action::End => break,
             Action::ConstantPool(pool) => constants = pool.strings,
@@ -880,6 +948,7 @@ fn scan_variables(
                         Avm1Value::Register(register) => {
                             registers.get(register).cloned().unwrap_or(Item::Other)
                         }
+                        Avm1Value::Bool(value) => Item::Constant(Constant::Bool(*value)),
                         _ => Item::Other,
                     });
                 }
@@ -939,8 +1008,64 @@ fn scan_variables(
                     uses.constants.push((name, value));
                 }
             }
-            Action::DefineLocal2 | Action::Pop | Action::If(_) | Action::Trace => {
+            Action::DefineLocal2 | Action::Pop | Action::Trace => {
                 pop(&mut stack);
+            }
+            Action::If(branch) => {
+                // `if (variable == value) gotoAndStop(n);` jumps past the goto unless the
+                // condition holds.
+                if let (
+                    true,
+                    Item::Test {
+                        variable,
+                        value,
+                        holds: false,
+                    },
+                ) = (own_goto, pop(&mut stack))
+                {
+                    let end = usize::try_from(next as isize + isize::from(branch.offset))
+                        .unwrap_or_default();
+                    guard = Some(((variable.0, variable.1, value), end));
+                    guarded_until = end;
+                }
+            }
+            Action::Equals | Action::Equals2 | Action::StrictEquals => {
+                let right = pop(&mut stack);
+                let left = pop(&mut stack);
+                stack.push(match (left, right) {
+                    (Item::Reads(mut reads), Item::Constant(value))
+                    | (Item::Constant(value), Item::Reads(mut reads))
+                        if reads.len() == 1 =>
+                    {
+                        Item::Test {
+                            variable: reads.remove(0),
+                            value,
+                            holds: true,
+                        }
+                    }
+                    (left, right) => Item::from(vec![left, right]),
+                });
+            }
+            Action::Not => {
+                let value = pop(&mut stack);
+                stack.push(match value {
+                    Item::Test {
+                        variable,
+                        value,
+                        holds,
+                    } => Item::Test {
+                        variable,
+                        value,
+                        holds: !holds,
+                    },
+                    // A variable as a condition holds when it's true.
+                    Item::Reads(mut reads) if reads.len() == 1 => Item::Test {
+                        variable: reads.remove(0),
+                        value: Constant::Bool(true),
+                        holds: false,
+                    },
+                    value => Item::from(vec![value]),
+                });
             }
             Action::StoreRegister(store) => {
                 if let Some(top) = stack.last() {
@@ -963,9 +1088,6 @@ fn scan_variables(
             | Action::Divide
             | Action::Modulo
             | Action::StringAdd
-            | Action::Equals
-            | Action::Equals2
-            | Action::StrictEquals
             | Action::Less
             | Action::Less2
             | Action::Greater
@@ -984,8 +1106,7 @@ fn scan_variables(
                 let left = pop(&mut stack);
                 stack.push(Item::from(vec![left, right]));
             }
-            Action::Not
-            | Action::ToInteger
+            Action::ToInteger
             | Action::ToNumber
             | Action::ToString
             | Action::Increment
@@ -1001,9 +1122,26 @@ fn scan_variables(
                 let value = pop(&mut stack);
                 stack.push(Item::from(vec![value]));
             }
-            Action::GotoFrame2(_) => {
+            Action::GotoFrame2(goto_frame) => {
                 let frame = pop(&mut stack);
+                if let (true, Item::Constant(_)) = (own_goto, &frame) {
+                    goto(&mut guard, position, !goto_frame.set_playing, uses);
+                }
                 uses.picks.extend(frame.reads());
+            }
+            // Like gotoAndStop
+            Action::GotoFrame(_) | Action::GotoLabel(_) => {
+                if own_goto {
+                    goto(&mut guard, position, true, uses);
+                }
+            }
+            Action::Stop => {
+                if let (true, Some(versions)) = (
+                    own_goto && position >= guarded_until,
+                    uses.versions.last_mut(),
+                ) {
+                    versions.stops = true;
+                }
             }
             Action::CallFunction | Action::CallMethod | Action::NewObject | Action::NewMethod => {
                 let is_call = matches!(action, Action::CallFunction | Action::CallMethod);
@@ -1036,13 +1174,10 @@ fn scan_variables(
                 }
                 stack.push(Item::Other);
             }
-            Action::Stop
-            | Action::Play
+            Action::Play
             | Action::NextFrame
             | Action::PreviousFrame
             | Action::Jump(_)
-            | Action::GotoFrame(_)
-            | Action::GotoLabel(_)
             | Action::StopSounds
             | Action::ToggleQuality
             | Action::EndDrag => {}
@@ -1131,8 +1266,10 @@ fn scan_variables(
     }
 }
 
-/// Gives the [`FrameVariable`]s of the movie of the root timeline `root` that have no
-/// value their value, before the scene menu jumps over the code that would.
+/// Gives the [`FrameVariable`]s that have no value their value, and makes the first
+/// condition of [`Versions`] that none of hold, before the scene menu jumps over the code
+/// that would. They're read from all the loaded movies, as the parts of games that load
+/// their scenes from other files use the root timeline's variables too.
 pub(crate) fn fill_frame_variables<'gc>(
     context: &mut UpdateContext<'gc>,
     root: DisplayObject<'gc>,
@@ -1140,29 +1277,67 @@ pub(crate) fn fill_frame_variables<'gc>(
     let Some(object) = root.object1() else {
         return;
     };
-    let movie = root.movie();
-    let variables = frame_variables(movie.data(), movie.version());
-    if variables.is_empty() {
+    let mut picks = FramePicks::default();
+    for movie in context.library.known_movies() {
+        if movie.is_action_script_3() {
+            continue;
+        }
+        let found = frame_variables(movie.data(), movie.version());
+        picks.variables.extend(found.variables);
+        picks.versions.extend(found.versions);
+    }
+    if picks.variables.is_empty() && picks.versions.is_empty() {
         return;
     }
     Avm1::run_with_stack_frame_for_display_object(root, context, |activation| {
-        for variable in variables {
-            let home = match variable.home {
-                Home::Root => object,
-                Home::Global => activation.global_object(),
-            };
-            if !matches!(stored(home, &variable.name, activation), Value::Undefined) {
-                continue;
-            }
-            let name = AvmString::new_utf8(activation.gc(), &variable.name);
-            let value = match variable.value {
-                Constant::Number(number) => Value::Number(number),
+        let home_of = |home: Home, activation: &mut Activation<'_, 'gc>| match home {
+            Home::Root => object,
+            Home::Global => activation.global_object(),
+        };
+        let set = |home: Avm1Object<'gc>,
+                   name: &str,
+                   value: &Constant,
+                   activation: &mut Activation<'_, 'gc>| {
+            let name = AvmString::new_utf8(activation.gc(), name);
+            let value = match value {
+                Constant::Number(number) => Value::Number(*number),
                 Constant::String(string) => AvmString::new_utf8(activation.gc(), string).into(),
+                Constant::Bool(value) => Value::Bool(*value),
             };
             // A setter of the game's that fails leaves the variable as it is.
             let _ = home.set(name, value, activation);
+        };
+        for variable in &picks.variables {
+            let home = home_of(variable.home, activation);
+            if matches!(stored(home, &variable.name, activation), Value::Undefined) {
+                set(home, &variable.name, &variable.value, activation);
+            }
+        }
+        for versions in &picks.versions {
+            let held = versions.conditions.iter().any(|(home, name, value)| {
+                let home = home_of(*home, activation);
+                holds(stored(home, name, activation), value)
+            });
+            if let (false, Some((home, name, value))) = (held, versions.conditions.first()) {
+                let home = home_of(*home, activation);
+                set(home, name, value, activation);
+            }
         }
     });
+}
+
+/// Whether `value` equals `constant`, the way the games compare them: numbers with true
+/// and false like 1 and 0.
+fn holds(value: Value<'_>, constant: &Constant) -> bool {
+    let number = |value: bool| if value { 1.0 } else { 0.0 };
+    match (value, constant) {
+        (Value::Bool(value), Constant::Bool(constant)) => value == *constant,
+        (Value::Number(value), Constant::Number(constant)) => value == *constant,
+        (Value::Bool(value), Constant::Number(constant)) => number(value) == *constant,
+        (Value::Number(value), Constant::Bool(constant)) => value == number(*constant),
+        (Value::String(value), Constant::String(constant)) => value.to_string() == *constant,
+        _ => false,
+    }
 }
 
 impl RootTimeline {
@@ -1749,9 +1924,12 @@ mod tests {
     /// A movie whose clips show the version of a character that a button picks on frame 1,
     /// the ways games do: on frame 2, `hero` shows `_root.char`, which frame 1 sets, `hat`
     /// shows `hat_version`, which only the button sets (in `_global`), and `shirt` shows
-    /// `_root.outfit`, which only a function sets, to what it's given.
+    /// `_root.outfit`, which only a function sets, to what it's given. `face` shows frame 1
+    /// if `_root.near1 == true`, and 2 if `near2` is, which frame 1 sets to false, like
+    /// Gotham City's, and `mask` likewise with `mask1` and `mask2`, the second of which
+    /// frame 1 sets to true.
     fn game_with_versions() -> Vec<u8> {
-        use swf::avm1::types::{GotoFrame2, StoreRegister};
+        use swf::avm1::types::{GotoFrame, GotoFrame2, If, StoreRegister};
         use swf::{
             Button, ButtonAction, ButtonActionCondition, PlaceObject, PlaceObjectAction, Sprite,
             Tag,
@@ -1778,6 +1956,28 @@ mod tests {
         let hero = show(&root_member("char"));
         let hat = show(&[push(&[string("hat_version")]), Action::GetVariable]);
         let shirt = show(&root_member("outfit"));
+        // if (_root.<first> == true) gotoAndStop(1); if (_root.<second> == true) gotoAndStop(2);
+        let versions = |variables: [&'static str; 2]| {
+            let mut code = Vec::new();
+            for (frame, variable) in (0..).zip(variables) {
+                let goto = actions(&[Action::GotoFrame(GotoFrame { frame })]);
+                let mut condition = root_member(variable);
+                condition.extend([
+                    push(&[Value::Bool(true)]),
+                    Action::Equals2,
+                    Action::Not,
+                    Action::If(If {
+                        offset: goto.len() as i16,
+                    }),
+                ]);
+                code.extend(actions(&condition));
+                code.extend(goto);
+            }
+            code.push(0);
+            code
+        };
+        let face = versions(["near1", "near2"]);
+        let mask = versions(["mask1", "mask2"]);
         // on (release) { _root.char = 2; _global.hat_version = 3; gotoAndPlay(2); }
         let mut button_code = actions(&[
             push(&[string("_root")]),
@@ -1807,6 +2007,12 @@ mod tests {
                 actions: &pick,
             }),
             push(&[string("char"), Value::Int(3)]),
+            Action::SetVariable,
+            push(&[string("near1"), Value::Bool(false)]),
+            Action::SetVariable,
+            push(&[string("near2"), Value::Bool(false)]),
+            Action::SetVariable,
+            push(&[string("mask2"), Value::Bool(true)]),
             Action::SetVariable,
             Action::Stop,
         ]);
@@ -1851,6 +2057,8 @@ mod tests {
             sprite(1, &hero),
             sprite(2, &hat),
             sprite(3, &shirt),
+            sprite(5, &face),
+            sprite(6, &mask),
             Tag::DefineButton2(Box::new(Button {
                 id: 4,
                 is_track_as_menu: false,
@@ -1866,6 +2074,8 @@ mod tests {
             place(1, 2, Some("hero")),
             place(2, 3, Some("hat")),
             place(3, 4, Some("shirt")),
+            place(5, 5, Some("face")),
+            place(6, 6, Some("mask")),
             Tag::DoAction(&frame_2),
             Tag::ShowFrame,
         ];
@@ -1891,22 +2101,34 @@ mod tests {
 
     #[test]
     fn find_frame_variables() {
-        use super::{Constant, FrameVariable, Home, frame_variables};
+        use super::{Constant, FrameVariable, Home, Versions, frame_variables};
         let variable = |home, name: &str, value| FrameVariable {
             home,
             name: name.to_owned(),
             value: Constant::Number(value),
         };
+        let versions = |names: [&str; 2]| Versions {
+            conditions: names
+                .iter()
+                .map(|name| (Home::Root, (*name).to_owned(), Constant::Bool(true)))
+                .collect(),
+            stops: false,
+        };
+        let picks = frame_variables(
+            &swf::decompress_swf(&game_with_versions()[..]).unwrap().data,
+            8,
+        );
         assert_eq!(
-            frame_variables(
-                &swf::decompress_swf(&game_with_versions()[..]).unwrap().data,
-                8
-            ),
+            picks.variables,
             [
                 variable(Home::Root, "char", 2.0),
                 variable(Home::Global, "hat_version", 3.0),
                 variable(Home::Root, "outfit", 1.0),
             ]
+        );
+        assert_eq!(
+            picks.versions,
+            [versions(["near1", "near2"]), versions(["mask1", "mask2"])]
         );
     }
 
@@ -1918,13 +2140,22 @@ mod tests {
         player.goto_and_play_root_frame(2);
         player.run_frame();
         player.run_frame();
-        // The value that frame 1 gave char is kept, and the others get one.
+        // The value that frame 1 gave char is kept, and the others get one. face shows its
+        // first version, which none did, and mask the one that frame 1 picked.
         assert_eq!(clip_frame(&mut player, "hero"), Some(3));
         assert_eq!(clip_frame(&mut player, "hat"), Some(3));
         assert_eq!(clip_frame(&mut player, "shirt"), Some(1));
+        assert_eq!(clip_frame(&mut player, "face"), Some(1));
+        assert_eq!(clip_frame(&mut player, "mask"), Some(2));
         // And they stay there.
         player.run_frame();
-        for (clip, frame) in [("hero", 3), ("hat", 3), ("shirt", 1)] {
+        for (clip, frame) in [
+            ("hero", 3),
+            ("hat", 3),
+            ("shirt", 1),
+            ("face", 1),
+            ("mask", 2),
+        ] {
             assert_eq!(
                 clip_frame(&mut player, clip),
                 Some(frame),
