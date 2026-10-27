@@ -1339,9 +1339,15 @@ pub(crate) fn fill_frame_variables<'gc>(
             // A setter of the game's that fails leaves the variable as it is.
             let _ = home.set(name, value, activation);
         };
+        let global = activation.global_object();
         for variable in &picks.variables {
             let home = home_of(variable.home, activation);
-            if matches!(stored(home, &variable.name, activation), Value::Undefined) {
+            // One that _global has, like NaN (a getter of its), isn't missing: code that reads
+            // it by its name alone finds it there.
+            let name = AvmString::new_utf8(activation.gc(), &variable.name);
+            if matches!(stored(home, &variable.name, activation), Value::Undefined)
+                && !global.has_property(activation, name)
+            {
                 set(home, &variable.name, &variable.value, activation);
             }
         }
@@ -2074,7 +2080,8 @@ mod tests {
         };
         let face = versions(["near1", "near2"]);
         let mask = versions(["mask1", "mask2"]);
-        // on (release) { _root.char = 2; _global.hat_version = 3; gotoAndPlay(2); }
+        // on (release) { _root.char = 2; _global.hat_version = 3; gotoAndPlay(2);
+        // gotoAndStop(NaN); }
         let mut button_code = actions(&[
             push(&[string("_root")]),
             Action::GetVariable,
@@ -2085,6 +2092,12 @@ mod tests {
             push(&[string("hat_version"), Value::Int(3)]),
             Action::SetMember,
             Action::Play,
+            push(&[string("NaN")]),
+            Action::GetVariable,
+            Action::GotoFrame2(GotoFrame2 {
+                set_playing: false,
+                scene_offset: 0,
+            }),
         ]);
         button_code.push(0);
         // function pick(n) { _root.outfit = n; } char = 3; stop();
@@ -2184,6 +2197,20 @@ mod tests {
         data
     }
 
+    /// The value of the root timeline's own variable `name`, as `Debug` writes it.
+    fn root_variable(player: &mut Player, name: &str) -> String {
+        use crate::display_object::TDisplayObject;
+        player.mutate_with_update_context(|context| {
+            let root = context.stage.root_clip().unwrap();
+            let object = root.object1().unwrap();
+            crate::avm1::Avm1::run_with_stack_frame_for_display_object(
+                root,
+                context,
+                |activation| format!("{:?}", super::stored(object, name, activation)),
+            )
+        })
+    }
+
     /// The frame that the movie clip named `name` on the root timeline is on.
     fn clip_frame(player: &mut Player, name: &str) -> Option<u16> {
         use crate::display_object::{TDisplayObject, TDisplayObjectContainer};
@@ -2220,6 +2247,7 @@ mod tests {
                 variable(Home::Root, "char", 2.0),
                 variable(Home::Global, "hat_version", 3.0),
                 variable(Home::Root, "outfit", 1.0),
+                variable(Home::Root, "NaN", 1.0),
             ]
         );
         assert_eq!(
@@ -2243,6 +2271,8 @@ mod tests {
         assert_eq!(clip_frame(&mut player, "shirt"), Some(1));
         assert_eq!(clip_frame(&mut player, "face"), Some(1));
         assert_eq!(clip_frame(&mut player, "mask"), Some(2));
+        // NaN, which the code reads like a variable, is _global's, so the root doesn't get one.
+        assert_eq!(root_variable(&mut player, "NaN"), "Undefined");
         // And they stay there.
         player.run_frame();
         for (clip, frame) in [

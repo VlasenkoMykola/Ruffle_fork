@@ -5,6 +5,7 @@ Usage: python swfinfo.py [--dump | --dump-main] <file or folder> [<file or folde
        python swfinfo.py --classify [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --unsupported [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --unsupported-names [--onefolderdeep] <folder> [<folder> ...]
+       python swfinfo.py --classify --menu-changes [--onefolderdeep] <folder> [<folder> ...]
        python swfinfo.py --scenes <file> [<file> ...]
        python swfinfo.py --variables <file> [<file> ...]
 
@@ -29,7 +30,12 @@ list (they're still counted). --unsupported-names prints only the paths of the g
 that aren't supported, one per line, to run this script on one at a time. With
 --onefolderdeep, these only look at the SWFs in the given folders and in their direct
 subfolders, like one folder per game, and leave out SWFs further down, like those
-bundled in HTML games.
+bundled in HTML games. With --menu-changes, --classify and --unsupported then list the
+games that a jump from Ruffle's scene menu does more to than show the scene, by the same
+rules as Ruffle: the variables that pick frames it gives values, the clips that pick
+their version with conditions it shows the first version of, and the exported clips it
+lists as scenes instead of a scene list that names none of them. It reads all of their
+code and their parts, so it takes longer.
 
 --scenes lists the scenes of games that keep their own list of them, with what the
 movie has under each name: the movie clip the game shows for it, its labels, and
@@ -551,12 +557,21 @@ class Value:
     """A value that code works out, read without running it: its code, as text, the
     variables it reads, and the constant it is, if it is one."""
 
-    def __init__(self, text, reads=(), constant=None, leaf=None, call=False):
+    def __init__(self, text, reads=(), constant=None, leaf=None, call=False, homes=(),
+                 timeline=None, test=None):
         self.text = text
         self.reads = set(reads)  # Variables read to work it out, but the one it is
         self.constant = constant
         self.leaf = leaf  # The variable or member it is, last in its path
         self.call = call  # Whether it's what a call returns
+        # As Ruffle's scene menu reads code (see `scan_variables` in core's root_timeline.rs):
+        # the variables of the root timeline ("root") or _global ("global") it reads, as
+        # (home, name), the one of those it is, if it's a timeline, and if it compares one of
+        # those variables with a constant, ((home, name), constant, whether it's true when
+        # they're equal)
+        self.homes = list(homes)
+        self.timeline = timeline
+        self.test = test
 
     def variables(self):
         return self.reads | ({self.leaf} if self.leaf else set())
@@ -564,8 +579,17 @@ class Value:
 
 class Statement:
     def __init__(self, offset, kind, text, reads=(), sets=None, frame=None, function=None,
-                 target=None):
+                 target=None, own=True, **details):
         self.offset = offset
+        # Whether the code works on its own timeline there, outside a tellTarget of another
+        self.own = own
+        # For an "if", its condition's Value.test and where the code it skips ends (`jump`);
+        # for a goto, whether it's an action that goes to a frame it names (`fixed`), and
+        # whether it stops there (`stops`)
+        self.test = details.get("test")
+        self.jump = details.get("jump")
+        self.fixed = details.get("fixed", False)
+        self.stops = details.get("stops", False)
         self.function = function  # The name of the function it's in, if it's in one
         # The timeline that it moves between frames, or shows or hides, when it's another's
         # than the code's own, like `_root.hero` in _root.hero.gotoAndStop(2)
@@ -611,15 +635,52 @@ def read_function(data, pos, code):
     return name, params, registers, body.u16()
 
 
-def statements(data, start, end):
+def menu_constant(value):
+    """The constant that `value` is, as Ruffle's scene menu reads code, if it's one: a number, a
+    string, True or False."""
+    if isinstance(value.constant, Special):
+        return {"true": True, "false": False}.get(value.constant)
+    return value.constant
+
+
+def timeline_home(path, target):
+    """The timeline named by `path`, like _root, / or _global, in code working on `target`
+    ("root", "clip" or "other"), if Ruffle's scene menu gives its variables values: "root" or
+    "global" (as `timeline_home` in core's root_timeline.rs)."""
+    lower = path.rstrip("/:").lower()
+    if lower in ("", "_root", "_level0"):
+        return "root"
+    if lower == "_global":
+        return "global"
+    # Movie clips are mostly placed on the root timeline.
+    if (lower == "_parent" and target == "clip") or (lower == "this" and target == "root"):
+        return "root"
+    return None
+
+
+def variable_home(path, target, version):
+    """(home, name) of the variable that `path` names, like version, _root.version or
+    /:version, in code working on `target`, if Ruffle's scene menu gives it a value: a clip that
+    doesn't have a variable reads _global's, from SWF 6."""
+    end = max(path.rfind("."), path.rfind(":"), path.rfind("/"))
+    if end < 0:
+        home = "root" if target == "root" else "global" if target == "clip" and version >= 6 else None
+        return (home, path) if home else None
+    home, name = timeline_home(path[:end], target), path[end + 1:]
+    return (home, name) if home and name else None
+
+
+def statements(data, start, end, owner="clip", version=8):
     """The statements of the AVM1 code in data[start:end], as far as reading it without
-    running it tells, in address order. Values it can't work out are "?"."""
+    running it tells, in address order. Values it can't work out are "?". `owner` is the
+    timeline whose code it is, "root" or "clip", and `version` the movie's SWF version."""
     constants, stack, registers, result = [], [], {}, []
-    # (end, stack, registers, name, local names) of the functions being read, innermost last,
-    # with what they replace
+    # (end, stack, registers, name, local names, scope) of the functions being read,
+    # innermost last, with what they replace
     functions = []
     local_names = None  # The parameters and local variables of the function being read
     told = None  # The target of tellTarget, if the code is in one
+    scope = owner  # The timeline the code works on: "root", "clip" or "other"
 
     def pop():
         return stack.pop() if stack else Value("?")
@@ -628,18 +689,18 @@ def statements(data, start, end):
         count = pop().constant
         return count if type(count) is int and 0 <= count <= 256 else None
 
-    def add(offset, kind, text, reads=(), sets=None, frame=None, target=None):
+    def add(offset, kind, text, reads=(), sets=None, frame=None, target=None, **details):
         indent = "  " * len(functions)
         function = (functions[-1][3] or "(anonymous)") if functions else None
         result.append(Statement(offset - start, kind, indent + text, reads, sets, frame, function,
-                                target))
+                                target, scope == owner, **details))
 
     def name_of(value):
         return value.constant if type(value.constant) is str else f"[{value.text}]"
 
     for offset, code, pos, length in decode_actions(data, start, end):
         while functions and offset >= functions[-1][0]:
-            _, stack, registers, function, local_names = functions.pop()
+            _, stack, registers, function, local_names, scope = functions.pop()
             add(offset, "other", "}")
             if not function:
                 stack.append(Value("function"))
@@ -661,14 +722,19 @@ def statements(data, start, end):
                 if type(name.constant) is str:
                     local = local_names is not None and name.constant in local_names
                     leaf = None if local or name.constant in CONSTANT_NAMES else path_leaf(name.constant)
-                    stack.append(Value(name.constant, leaf=leaf))
+                    timeline = timeline_home(name.constant, scope) if name.constant else None
+                    found = None if timeline else variable_home(name.constant, scope, version)
+                    stack.append(Value(name.constant, leaf=leaf, homes=[found] if found else [],
+                                       timeline=timeline))
                 else:
                     stack.append(Value(f"eval({name.text})", name.variables()))
             elif code == 0x4E:  # GetMember
                 member, target = pop(), pop()
                 if type(member.constant) is str:
                     leaf = None if PATH_NAMES.match(member.constant) else member.constant
-                    stack.append(Value(f"{target.text}.{member.constant}", target.reads, leaf=leaf))
+                    homes = [(target.timeline, member.constant)] if target.timeline else []
+                    stack.append(Value(f"{target.text}.{member.constant}", target.reads, leaf=leaf,
+                                       homes=homes))
                 else:
                     stack.append(Value(f"{target.text}[{member.text}]",
                                        target.variables() | member.variables()))
@@ -712,17 +778,34 @@ def statements(data, start, end):
                 stack.append(Value(f"getProperty({target.text}, {prop})", target.variables()))
             elif code in BINARY_OPERATORS:
                 right, left = pop(), pop()
+                test = None
+                if code in (0x0E, 0x49, 0x66):  # Equals, Equals2, StrictEquals
+                    for read, other in ((left, right), (right, left)):
+                        constant = menu_constant(other)
+                        if len(read.homes) == 1 and not read.test and not read.timeline and \
+                                constant is not None:
+                            test = (read.homes[0], constant, True)
+                            break
                 stack.append(Value(f"({left.text} {BINARY_OPERATORS[code]} {right.text})",
-                                   left.variables() | right.variables()))
+                                   left.variables() | right.variables(),
+                                   homes=left.homes + right.homes, test=test))
             elif code in UNARY_FUNCTIONS:
                 value = pop()
-                stack.append(Value(f"{UNARY_FUNCTIONS[code]}({value.text})", value.variables()))
+                stack.append(Value(f"{UNARY_FUNCTIONS[code]}({value.text})", value.variables(),
+                                   homes=value.homes))
             elif code == 0x12:  # Not
                 value = pop()
-                stack.append(Value(f"!{value.text}", value.variables()))
+                if value.test:
+                    test = (value.test[0], value.test[1], not value.test[2])
+                elif len(value.homes) == 1:  # A variable as a condition holds when it's true.
+                    test = (value.homes[0], True, False)
+                else:
+                    test = None
+                stack.append(Value(f"!{value.text}", value.variables(), homes=value.homes, test=test))
             elif code in (0x50, 0x51):  # Increment, Decrement
                 value = pop()
-                stack.append(Value(f"({value.text} {'+' if code == 0x50 else '-'} 1)", value.variables()))
+                stack.append(Value(f"({value.text} {'+' if code == 0x50 else '-'} 1)", value.variables(),
+                                   homes=value.homes))
             elif code == 0x4C:  # PushDuplicate
                 value = pop()
                 stack += [value, value]
@@ -752,7 +835,7 @@ def statements(data, start, end):
                 text = ("new " if code in (0x40, 0x53) else "") + \
                     f"{callee}({', '.join(arg.text for arg in args)})"
                 moved = target.text if target is not None and code == 0x52 else None
-                if function in ("gotoAndPlay", "gotoAndStop") and args:
+                if function and function.lower() in ("gotoandplay", "gotoandstop") and args:
                     add(offset, "goto", text, args[0].variables(), frame=args[0], target=moved)
                     stack.append(Value("undefined"))
                 elif function in ("nextFrame", "prevFrame", "play", "stop") and moved:
@@ -764,15 +847,16 @@ def statements(data, start, end):
                 flags = body.u8()
                 frame = pop()
                 add(offset, "goto", f"{'gotoAndPlay' if flags & 1 else 'gotoAndStop'}({frame.text})",
-                    frame.variables(), frame=frame, target=told)
+                    frame.variables(), frame=frame, target=told,
+                    fixed=menu_constant(frame) is not None, stops=not flags & 1)
             elif code == 0x81:  # GotoFrame
                 frame = body.u16() + 1
                 add(offset, "goto", f"gotoFrame({frame})", frame=Value(str(frame), constant=frame),
-                    target=told)
+                    target=told, fixed=True, stops=True)
             elif code == 0x8C:  # GotoLabel
                 label = body.cstring()
                 add(offset, "goto", f"gotoLabel({label!r})", frame=Value(repr(label), constant=label),
-                    target=told)
+                    target=told, fixed=True, stops=True)
             elif code in (0x04, 0x05, 0x06, 0x07):
                 add(offset, "other", {0x04: "nextFrame()", 0x05: "prevFrame()", 0x06: "play()",
                                       0x07: "stop()"}[code], target=told)
@@ -780,13 +864,17 @@ def statements(data, start, end):
                 target = body.cstring()
                 add(offset, "other", f"tellTarget({target!r}) {{" if target else "}")
                 told = target or None
+                scope = owner if not target else \
+                    "root" if timeline_home(target, owner) == "root" else "other"
             elif code == 0x20:  # SetTarget2
                 told = pop().text
+                scope = "other"
                 add(offset, "other", f"tellTarget({told}) {{")
             elif code == 0x9D:  # If
                 condition = pop()
-                add(offset, "if", f"if {condition.text} -> {pos + length + body.i16() - start:04x}",
-                    condition.variables())
+                jump = pos + length + body.i16() - start
+                add(offset, "if", f"if {condition.text} -> {jump:04x}", condition.variables(),
+                    test=condition.test, jump=jump)
             elif code == 0x99:  # Jump
                 add(offset, "other", f"-> {pos + length + body.i16() - start:04x}")
             elif code == 0x26:  # Trace
@@ -819,7 +907,7 @@ def statements(data, start, end):
             elif code in (0x9B, 0x8E):  # DefineFunction(2)
                 name, params, function_registers, size = read_function(data, pos, code)
                 add(offset, "other", f"function {name}({', '.join(params)}) {{")
-                functions.append((pos + length + size, stack, registers, name, local_names))
+                functions.append((pos + length + size, stack, registers, name, local_names, scope))
                 stack, registers, local_names = [], dict(function_registers), set(params)
             elif code == 0x9E:  # Call
                 add(offset, "other", f"call({pop().text})")
@@ -1888,11 +1976,177 @@ def launcher_method(path, movie):
     return found
 
 
-def classify(args, unsupported_only=False, names_only=False, max_depth=None):
+def block_owner(title, movie):
+    """Whose code a block of `movie.blocks` is, as Ruffle's core tells: "root" for the main
+    timeline's frames and the buttons placed on it, "clip" for the others."""
+    if re.match(r"frame \d+$", title):
+        return "root"
+    button = re.match(r"button #(\d+)$", title)
+    if button and any(re.match(r"frame \d+$", place)
+                      for place in movie.placements.get(int(button.group(1)), [])):
+        return "root"
+    return "clip"
+
+
+def frame_picks(movie):
+    """What Ruffle's scene menu gives values to in `movie` before it jumps, the way
+    `frame_variables` in core's root_timeline.rs finds them: ([(home, name)] of the variables
+    that pick frames, which it gives a value if they have none, and [conditions] of each clip
+    that picks its version with conditions, the first of which it makes hold if none does)."""
+    variables, versions = [], []
+    for title, start, end in movie.blocks:
+        owner = block_owner(title, movie)
+        try:
+            code = statements(movie.body, start, end, owner, movie.version)
+        except Exception:  # One odd block shouldn't hide the rest
+            continue
+        conditions, stops, guard, guarded_until = [], False, None, 0
+        for statement in code:
+            if statement.kind == "goto" and statement.frame is not None:
+                variables += statement.frame.homes
+            # Versions are picked by a clip's own code, outside its functions.
+            if owner != "clip" or statement.function is not None or not statement.own:
+                continue
+            if statement.kind == "if" and statement.test and not statement.test[2]:
+                (home, name), constant, _ = statement.test
+                guard, guarded_until = ((home, name, constant), statement.jump), statement.jump
+            elif statement.kind == "goto" and statement.fixed:
+                if guard and statement.offset < guard[1]:
+                    conditions.append(guard[0])
+                else:
+                    stops |= statement.stops
+                guard = None
+            elif statement.text.strip() == "stop()" and statement.target is None and \
+                    statement.offset >= guarded_until:
+                stops = True
+        if not stops and len(conditions) > 1 and conditions not in versions:
+            versions.append(conditions)
+    found, seen = [], set()
+    # Names starting with _ are properties, like _currentframe, and _global has the constants.
+    for home, name in variables:
+        if not name.startswith("_") and name not in CONSTANT_NAMES and (home, name.lower()) not in seen:
+            seen.add((home, name.lower()))
+            found.append((home, name))
+    return found, versions
+
+
+def clips_over_list(movie, launcher_list=None):
+    """(list name, its values, scene clips) when Ruffle's scene menu lists the movie clips that
+    `movie` exports for its scenes instead of a scene list, as no name in the list is one of
+    them, like One Piece Nami's numbers in Qvar, or the list that One Piece of Luck's launcher
+    leaves in _global for its part (`launcher_list`), as `SceneList::of` in core does."""
+    if movie.as3 or not has_set_screen(movie):
+        return None
+    lists = [(name, values) for name, values in movie.main.arrays if name in SCENE_LISTS]
+    if not lists and launcher_list:
+        lists = [launcher_list]
+    clips = scene_clips(movie)
+    if not lists or not clips:
+        return None
+    name, values = lists[0]
+    sprites = {sprite_id for sprite_id, _, _ in movie.sprites}
+    exported = {export.lower() for character, export in movie.exports.items() if character in sprites}
+    if any(type(value) is str and value.lower() in exported for value in values):
+        return None
+    return name, values, clips
+
+
+MAX_PARTS = 60
+
+
+def game_parts(path, movie):
+    """(name, Movie) of the parts that the game at `path` loads: the files in a folder its code
+    names, whose names start like it says, like "parts/gcs-", and the other SWFs next to it
+    that it names."""
+    folder = os.path.dirname(os.path.abspath(path))
+    found = {}
+    for string in dedupe(movie.main.strings + movie.nested.strings):
+        if not re.fullmatch(r"[\w.-]+(/[\w.-]*)+", string):
+            continue
+        directory, prefix = os.path.split(os.path.join(folder, *string.split("/")))
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if name.lower().startswith(prefix.lower()):
+                found.setdefault(os.path.join(directory, name), name)
+    text = movie.text()
+    try:
+        neighbours = sorted(os.listdir(folder))
+    except OSError:
+        neighbours = []
+    for name in neighbours:
+        full = os.path.join(folder, name)
+        if full != os.path.abspath(path) and name.lower().endswith(".swf") and \
+                re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", text):
+            found.setdefault(full, name)
+    parts = []
+    for full, name in list(found.items())[:MAX_PARTS]:
+        try:
+            data = open(full, "rb").read()
+            if len(data) > 8 and decompress(data):
+                parts.append((name, Movie(data)))
+        except Exception:  # A part that can't be read doesn't stop the rest
+            continue
+    return parts
+
+
+def menu_changes(path, movie):
+    """What a jump from Ruffle's scene menu now does to the game at `path` beyond showing the
+    scene, as lines of text: the variables it gives values, the clips it shows the first
+    version of, and the clips it lists instead of a scene list."""
+    if movie.as3:
+        return []
+    changes = []
+    parts = game_parts(path, movie)
+    found = clips_over_list(movie)
+    launcher_list = next(((name, values) for name, values in movie.main.arrays
+                          if name in SCENE_LISTS), None)
+    sources = [(None, found)] + [(name, clips_over_list(part, launcher_list)) for name, part in parts]
+    for part_name, found in sources:
+        if found:
+            name, values, clips = found
+            whose = f"that its part {part_name} exports" if part_name else "it exports"
+            changes.append(f"lists the {len(clips)} clips {whose} ({limited(clips, str, 4)}) as its "
+                           f"scenes, instead of {name} ({limited(values, repr, 4)})")
+    variables, versions = [], []
+    for name, part in [(None, movie)] + parts:
+        if part.as3:
+            continue
+        found_variables, found_versions = frame_picks(part)
+        variables += [variable for variable in found_variables if variable not in variables]
+        versions += [conditions for conditions in found_versions if conditions not in versions]
+    def listed(items, limit):
+        items = list(items)
+        more = f", ... (+{len(items) - limit} more)" if len(items) > limit else ""
+        return ", ".join(items[:limit]) + more
+
+    def as_code(constant):
+        return {True: "true", False: "false"}.get(constant, repr(constant)) \
+            if type(constant) in (bool, str) else str(constant)
+
+    if variables:
+        shown = [f"{name} (in _global)" if home == "global" else name for home, name in variables]
+        count = "1 variable that picks frames a value, if it has" if len(variables) == 1 else \
+            f"{len(variables)} variables that pick frames values, if they have"
+        changes.append(f"gives {count} none: {listed(shown, 8)}")
+    if versions:
+        firsts = dedupe(f"{conditions[0][1]} = {as_code(conditions[0][2])}" for conditions in versions)
+        kinds = "1 kind of clip that picks its" if len(versions) == 1 else \
+            f"{len(versions)} kinds of clips that pick their"
+        changes.append(f"shows the first version of {kinds} version with conditions, if none holds, "
+                       f"setting {listed(firsts, 6)}")
+    return changes
+
+
+def classify(args, unsupported_only=False, names_only=False, max_depth=None, menu=False):
     """Prints how each game in the given folders handles its scenes, and a tally. With
     `unsupported_only`, the supported games are left out of the list. With `names_only`,
     it prints only the paths of the games that aren't supported. With `max_depth`, only
-    the SWFs that many folders down or less are looked at (1 for direct subfolders)."""
+    the SWFs that many folders down or less are looked at (1 for direct subfolders). With
+    `menu`, it then lists what a jump from the scene menu now does to the games beyond
+    showing the scene (see `menu_changes`)."""
     by_folder = {}  # Folder -> (folder to show it relative to, SWFs in it)
     for arg in args:
         base = os.path.dirname(os.path.abspath(arg))
@@ -1910,6 +2164,7 @@ def classify(args, unsupported_only=False, names_only=False, max_depth=None):
             by_folder.setdefault(os.path.dirname(os.path.abspath(arg)), (base, []))[1].append(arg)
 
     statuses, details, unknown, part_count = {}, {}, [], 0
+    changed = []  # (game, what a menu jump does to it)
     linked_folders = {}  # Folder -> names of the folders its SWFs name, like "parts"
     for folder, (base, folder_paths) in by_folder.items():
         # SWFs in a subfolder that a SWF above it names, like "parts/", are its parts.
@@ -1961,6 +2216,13 @@ def classify(args, unsupported_only=False, names_only=False, max_depth=None):
             elif status == UNKNOWN:
                 shown = os.path.relpath(path, base).replace(os.sep, "/")
                 unknown.append(f"{shown} {description[description.index('('):]}")
+            if menu and isinstance(movie, Movie):
+                try:
+                    changes = menu_changes(path, movie)
+                except Exception as e:  # Keep going, so one odd game doesn't hide the rest
+                    changes = [f"couldn't tell: {type(e).__name__}: {e}"]
+                if changes:
+                    changed.append((os.path.relpath(path, base).replace(os.sep, "/"), changes))
             if names_only:
                 if status != SUPPORTED:
                     print(path)
@@ -1982,6 +2244,13 @@ def classify(args, unsupported_only=False, names_only=False, max_depth=None):
         were = "SWF was" if part_count == 1 else "SWFs were"
         print(f"   ({part_count} {were} taken for parts of these games and left out: those in "
               f"a subfolder that a game names, like parts/, and those another SWF next to them names)")
+    if menu:
+        print(f"== a jump from the scene menu changes more than the scene in {len(changed)} of "
+              f"these games:")
+        for game, changes in changed:
+            print(f"   {game}:")
+            for change in changes:
+                print(f"      - {change}")
     return 0
 
 
@@ -1992,8 +2261,10 @@ def main(args):
     unsupported_only = "--unsupported" in args or names_only
     classifying, scenes = "--classify" in args or unsupported_only, "--scenes" in args
     variables = "--variables" in args
+    menu = "--menu-changes" in args
+    classifying = classifying or menu
     modes = ("--dump", "--dump-main", "--classify", "--unsupported", "--unsupported-names", "--scenes",
-             "--variables", "--onefolderdeep")
+             "--variables", "--onefolderdeep", "--menu-changes")
     unknown_modes = [arg for arg in args if arg.startswith("--") and arg not in modes]
     if unknown_modes:  # It would be taken for a file name, and everything else described
         print(f"Unknown option {unknown_modes[0]}; this version has: {', '.join(modes)}")
@@ -2012,7 +2283,7 @@ def main(args):
     except AttributeError:
         pass
     if classifying:
-        return classify(args, unsupported_only, names_only, max_depth)
+        return classify(args, unsupported_only, names_only, max_depth, menu)
     if scenes or variables:
         for path in args:
             try:

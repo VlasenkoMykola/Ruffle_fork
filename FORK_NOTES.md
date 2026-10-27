@@ -74,7 +74,8 @@ In `core/src/root_timeline.rs` and `core/src/player.rs`:
   `this.x` and a bare `x` in the root's code are the root's; `_global.x` and a bare `x` in
   a clip's code (from SWF 6, as a clip without it reads `_global`'s) are `_global`'s;
   `_parent.x` in a clip's code is taken for the root's. Names starting with `_` are left
-  out, as properties. Versions picked with conditions, like Gotham City's girls, which
+  out, as properties, and so are the ones `_global` has, getters included (`has_property`),
+  like `NaN`, which a bare `NaN` in the root's code would otherwise have set on the root. Versions picked with conditions, like Gotham City's girls, which
   show the person next to them with `if (_root.person1nearGirl1 == true) gotoAndStop(1)`
   and so on (set to false on the screen where they're placed, and true by its buttons):
   in a clip's own code (not in its functions), an `If` on `variable == constant` (or a
@@ -302,6 +303,13 @@ output they paste back, since the games themselves aren't shared:
 - `--scenes <files>`: for games with their own scene list, each entry with the clip the
   movie exports under that name (frames, labels, which engine functions and variables its
   code and the code inside it use), or that it has none; then the main timeline's code.
+- `--menu-changes` (with `--classify` or `--unsupported`): then lists the games that a jump
+  from the scene menu does more to than show the scene, by core's rules, ported to the
+  script (`frame_picks`, `clips_over_list`, `menu_changes`, reading the parts each game
+  names with `game_parts`): the variables it gives values, the version clips it shows the
+  first version of, and the exported clips it lists instead of a scene list naming none,
+  for the user to re-test. `statements` tracks, for this, the variables' homes, `==`
+  conditions, fixed gotos and tellTarget scopes, like core's `scan_variables`.
 - `--variables <files>`: the code that picks a timeline's frame with a variable (or, in a
   clip, with a condition), like a character's version picked earlier in the game, then
   where the game sets each variable that code reads (with the frame a button sits on,
