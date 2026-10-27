@@ -265,6 +265,12 @@ Metropolis Files' version (`92c11d307`), 338 supported, 7 frame labels only, 7 o
 jumps supported and 1 unknown (boundary expansion lab, which doesn't run in Ruffle): every
 game of the collection that runs in Ruffle is supported.
 
+After menu jumps (Android `a2dfe36`, Ruffle `f12e7bad7`): Universal Soldier's character no
+longer plays through its versions (frame variables), nor do Gotham City's girls (version
+conditions, read from its part `gcs-game`), and One Piece of Luck's and One Piece Nami's
+scene menus, which left a blank screen, work in full (their exported clips over a list
+naming none of them).
+
 ## Frontends
 
 - **Desktop** (`desktop/src/gui/menu_bar.rs`): a Scenes menu with the game's scenes or the
