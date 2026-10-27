@@ -291,8 +291,11 @@ place, the same one each frame, and its color transform could make it invisible.
 `DynamicTransformsPool` (`render/wgpu/src/dynamic_transforms.rs`) now gives each chunk
 of a frame buffers of its own (transforms, bitmap quad vertices and bind group, 32 KiB in
 all), reused from the first once the frame is submitted; past 256 chunks in a frame,
-they're reused in turn. This is a guess from the symptoms, untested on a device when
-made: nothing here or on the emulators reproduces the bug.
+they're reused in turn. This was a guess from the symptoms: nothing here or on the
+emulators reproduces the bug. On the user's device (Android `f135898`), it may have made
+slightly fewer elements jump, but some still do; the user may come back to these four
+games later. Next steps then: whether the Windows build shows it too (core or Android),
+and a screenshot with elements out of place (which ones, and by how much).
 
 Ruled out first: the mouse parallax `move_viewpoint` in their screens (defined, never
 called), and timeline rewinds. A clip that a later frame puts at a depth in place of
