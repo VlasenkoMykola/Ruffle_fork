@@ -99,8 +99,10 @@ order, and the other `screen_*` ones, like `screen_end`). A list that names none
 movie clips the root movie exports gives way to those clips when there are some: One Piece
 of Luck's launcher leaves `_global.screens` (`screen_0`...) for the part it loads over
 itself, which exports `mainmenu`, `screen1`... and has no list, so the menu called
-`setScreen` with names the part doesn't have, and showed a blank screen. Big Queen 1's
-parts export clips with the names in its launcher's list, which is kept. The scene being shown is the one named in
+`setScreen` with names the part doesn't have, and showed a blank screen. One Piece Nami
+has 18 numbers in `Qvar`, which aren't scenes, and exports `main_menu`, `screen_1`...
+`screen_6`; it gets its clips the same way. Big Queen 1's parts export clips with the
+names in its launcher's list, which is kept. The scene being shown is the one named in
 `screen_name`, or else numbered (1-based) in `Qpos`, `pos`, `Qmod` or `gn`, or else, for exported
 clips, the one the root's child `screen` is an instance of. To switch, core does what the
 games' own controls do: stop all sounds, show the mouse cursor, and call the root's

@@ -1660,12 +1660,18 @@ mod tests {
     /// `setScreen(name)` that attaches the clip exported as `name` as `screen`, which it
     /// does with `mainmenu` first, like the games without a scene list.
     fn game_with_scene_clips(exports: &[&'static str]) -> Vec<u8> {
-        game_with_scene_clips_and_list(exports, &[])
+        game_with_scene_clips_and_list(exports, "_global", "screens", &[])
     }
 
-    /// Like [`game_with_scene_clips`], with `list` in `_global.screens` too, as a launcher
-    /// that loaded the movie over itself left it, like One Piece of Luck's.
-    fn game_with_scene_clips_and_list(exports: &[&'static str], list: &[&'static str]) -> Vec<u8> {
+    /// Like [`game_with_scene_clips`], with `list` in `timeline.variable` too: like the list
+    /// that One Piece of Luck's launcher leaves in `_global.screens` when it loads its part
+    /// over itself, or One Piece Nami's numbers in `_root.Qvar`, which aren't scenes.
+    fn game_with_scene_clips_and_list(
+        exports: &[&'static str],
+        timeline: &'static str,
+        variable: &'static str,
+        list: &[Value<'static>],
+    ) -> Vec<u8> {
         // attachMovie(name, "screen", 0);
         let show_scene = actions(&[
             push(&[Value::Int(0), string("screen"), string("name")]),
@@ -1677,13 +1683,13 @@ mod tests {
         // _global.screens = [...]; function setScreen(name) { ... } setScreen("mainmenu");
         let mut setup = Vec::new();
         if !list.is_empty() {
-            let mut values = vec![string("_global"), string("screens")];
-            values.extend(list.iter().rev().map(|name| string(name)));
+            let mut values = vec![string(variable)];
+            values.extend(list.iter().rev().cloned());
             values.push(Value::Int(list.len() as i32));
             setup = actions(&[
-                push(&[string("_global")]),
+                push(&[string(timeline)]),
                 Action::GetVariable,
-                push(&values[1..]),
+                push(&values),
                 Action::InitArray,
                 Action::SetMember,
             ]);
@@ -1820,15 +1826,33 @@ mod tests {
         // Piece of Luck's, isn't the scenes'.
         let player = load_swf(&game_with_scene_clips_and_list(
             &["mainmenu", "screen1", "screen2"],
-            &["screen_0", "screen_1"],
+            "_global",
+            "screens",
+            &[string("screen_0"), string("screen_1")],
         ));
         let mut player = player.lock().unwrap();
         let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
         assert_eq!(scenes.names, ["mainmenu", "screen1", "screen2"]);
+        // Nor are numbers in a variable that other versions keep their lists in, like One
+        // Piece Nami's.
+        let player = load_swf(&game_with_scene_clips_and_list(
+            &["main_menu", "screen_1", "screen_2", "end"],
+            "_root",
+            "Qvar",
+            &[Value::Int(79615), Value::Int(85890), Value::Int(86476)],
+        ));
+        let mut player = player.lock().unwrap();
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(scenes.names, ["main_menu", "screen_1", "screen_2"]);
+        player.goto_game_scene(2);
+        let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
+        assert_eq!(scenes.current, Some(2));
         // One that names them, like Big Queen 1's, is.
         let player = load_swf(&game_with_scene_clips_and_list(
             &["mainmenu", "screen_1", "screen_2"],
-            &["screen_0", "screen_1", "screen_2", "screen_3"],
+            "_global",
+            "screens",
+            &["screen_0", "screen_1", "screen_2", "screen_3"].map(string),
         ));
         let mut player = player.lock().unwrap();
         let scenes = player.root_timeline().unwrap().game_scenes.unwrap();
