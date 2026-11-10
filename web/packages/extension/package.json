@@ -18,11 +18,11 @@
     "devDependencies": {
         "@tsconfig/strictest": "^2.0.8",
         "@types/archiver": "^8.0.0",
-        "@types/chrome": "^0.3.5",
+        "@types/chrome": "^0.3.7",
         "@types/common-tags": "^1.8.4",
         "@types/jsonwebtoken": "^9.0.10",
         "archiver": "^8.0.0",
-        "axios": "^1.20.0",
+        "axios": "^1.21.0",
         "esbuild": "^0.28.2",
         "form-data": "^4.0.6",
         "json5": "^2.2.3",
